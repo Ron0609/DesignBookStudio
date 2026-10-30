@@ -17,6 +17,7 @@ import '@milkdown/crepe/theme/frame.css'
 import { BookOpen, ChevronDown, ChevronRight, CircleHelp, Clock3, FileJson2, FileText, Folder, GitBranch, GitCommitHorizontal, GitCompareArrows, GitFork, HardDrive, History, Image, LayoutGrid, ListFilter, LoaderCircle, Plus, RefreshCw, Search, Settings2, ShieldCheck, Sparkles, Upload, X, CloudDownload, CloudUpload } from 'lucide-react'
 import { UpdatePanel } from './UpdatePanel'
 import { prepareWorkspace, updateDocumentPath, updateHit, type UpdateRecord, type ChangeFile, type ChangeHunk, type SyncResult } from './lib/workspace'
+import { ImagePreview, isPreviewImage } from './ImagePreview'
 import './App.css'
 
 type GitBranchInfo = { name: string; current: boolean; remote: boolean; upstream: string | null; ahead: number; behind: number }
@@ -166,6 +167,7 @@ function App() {
   const restorationStarted = useRef(false)
   const dirty = content !== saved
   useLayoutEffect(() => { closeState.current = { dirty, saved } }, [dirty, saved])
+  const isImage = isPreviewImage(current)
   const isJson = current.endsWith('.json')
   useEffect(() => {
     if (!isJson || !searchTarget || editing || showSearchSource || !jsonSource.current) return
@@ -247,7 +249,7 @@ function App() {
         setDocs(files); setGit(status); setDocumentDirectories(directories); setProjectInfo(context)
         setDocsReady(directories.length > 0)
         const next = files.find((file) => file.path === openedPath) ?? files.find((file) => file.kind === 'markdown' || file.kind === 'json')
-        const text = next ? await invoke<string>('read_document', { path: next.path }) : ''
+        const text = next && next.kind !== 'image' ? await invoke<string>('read_document', { path: next.path }) : ''
         setCurrent(next?.path ?? ''); setContent(text); setSaved(text); setEditing(false); setExternalChanged(false)
         setSearchTarget(null); setSearchMatches([]); setQuery(''); setEditorRevision((value) => value + 1)
       }
@@ -349,7 +351,7 @@ function App() {
     const pending = readEditorSnapshot.current()
     if ((dirty || (pending !== null && pending !== saved)) && !await confirmDialog('未保存の変更があります。破棄して選択した位置を開きますか？', { kind: 'warning' })) return
     try {
-      const text = isTauri() && repo ? await invoke<string>('read_document', { path }) : (demoContent[path] ?? `# ${path.split('/').at(-1)?.replace(/\.md$/, '')}\n\nこのファイルはサンプルです。ローカルリポジトリを開くと実ファイルを編集できます。`)
+      const text = isPreviewImage(path) ? '' : isTauri() && repo ? await invoke<string>('read_document', { path }) : (demoContent[path] ?? `# ${path.split('/').at(-1)?.replace(/\.md$/, '')}\n\nこのファイルはサンプルです。ローカルリポジトリを開くと実ファイルを編集できます。`)
       setCurrent(path); setContent(text); setSaved(text); setMode('write')
       setEditing(false); setSearchTarget(target && target.line > 0 ? target : null); setShowSearchSource(false); setEditorRevision((value) => value + 1)
       if (target?.line) setNotice(selectionForHit(text, target) ? `検索位置: ${path} · 行 ${target.line}、列 ${target.column}` : '検索後にファイルが変更されました。もう一度検索してください。')
@@ -527,7 +529,7 @@ function App() {
     await runGitManagerAction('git_commit', { message: commitMessage.trim() })
   }
   useEffect(() => {
-    if (!repo || !current || !isTauri() || busy) return
+    if (!repo || !current || isImage || !isTauri() || busy) return
     let active = true
     const timer = window.setInterval(async () => {
       try {
@@ -541,7 +543,7 @@ function App() {
       } catch (error) { if (active) setNotice(`外部変更を確認できません: ${String(error)}`) }
     }, 2500)
     return () => { active = false; window.clearInterval(timer) }
-  }, [repo, current, dirty, saved, busy])
+  }, [repo, current, isImage, dirty, saved, busy])
 
   useEffect(() => {
     if (!repo || !docsReady || !isTauri() || busy) return
@@ -555,11 +557,11 @@ function App() {
   }, [repo, docsReady, busy])
 
   useEffect(() => {
-    if (!repo || !current || isJson || !isTauri() || busy) return
+    if (!repo || !current || isImage || isJson || !isTauri() || busy) return
     const refs = extractImageReferences(content).filter((ref) => !/^(https?:|data:|#)/i.test(ref))
     const timer = window.setTimeout(() => { void invoke<string[]>('check_image_references', { documentPath: current, references: refs }).then(setMissingImages).catch((error) => setNotice(`画像参照を確認できません: ${String(error)}`)) }, 350)
     return () => window.clearTimeout(timer)
-  }, [repo, current, isJson, content, busy])
+  }, [repo, current, isImage, isJson, content, busy])
 
   useEffect(() => {
     if (!isTauri()) return
@@ -646,11 +648,11 @@ function App() {
                 onDragEnd={() => { setDraggedPath(''); setDropDirectory('') }}
                 onContextMenu={(event) => showTreeMenu(event, file.path, false)}
                 className={`file-row ${current === file.path ? 'selected' : ''}`} onClick={() => void selectFile(file.path)} title={searchMatches.find((match) => match.path === file.path)?.excerpt}>
-                <span className="tree-indent" />{file.kind === 'json' ? <FileJson2 size={14} className="json-icon" /> : <FileText size={14} className="md-icon" />}<span>{file.path.split('/').at(-1)?.replace(/\.md$/, '')}</span>{current === file.path && dirty && <i className="dirty-dot" />}
+                <span className="tree-indent" />{file.kind === 'image' ? <Image size={14} className="md-icon" /> : file.kind === 'json' ? <FileJson2 size={14} className="json-icon" /> : <FileText size={14} className="md-icon" />}<span>{file.path.split('/').at(-1)?.replace(/\.md$/, '')}</span>{current === file.path && dirty && <i className="dirty-dot" />}
               </button>)}
             </section>
           })}
-          {isTauri() && repo && docsReady && docs.length === 0 && <div className="empty-tree">Markdown / JSON ファイルが見つかりません</div>}
+          {isTauri() && repo && docsReady && docs.length === 0 && <div className="empty-tree">Markdown / JSON / JPG / PNG ファイルが見つかりません</div>}
         </nav>
         <div className="sidebar-bottom"><button><Settings2 size={15} />設定</button><button><CircleHelp size={15} />ヘルプと使い方</button><div className="user-card"><div className="avatar">D</div><div><b>DesignBook Studio</b><small>ローカルワークスペース</small></div><ChevronDown size={14} /></div></div>
       </aside>
@@ -658,25 +660,25 @@ function App() {
         <div className="breadcrumbs"><span>{current.split('/')[0] || 'DesignDocs'}</span><ChevronRight size={13} /><span>{current.split('/').slice(1, -1).join(' / ') || 'ホーム'}</span><ChevronRight size={13} /><b>{current.split('/').at(-1)?.replace(/\.md$|\.json$/, '')}</b><div className="crumb-actions"><button title="変更履歴" onClick={() => void gitAction('git_history')}><History size={15} /></button><button title="ファイルの詳細"><ListFilter size={15} /></button></div></div>
         <div className="document-scroll">
           {repo && isTauri() && !docsReady ? <section className="empty-docs"><div className="empty-docs-icon"><Folder size={24} /></div><h1>この Unity プロジェクトには設計書ディレクトリがありません</h1><p>既存ファイルは変更していません。作成前に、追加するディレクトリと README.md を確認できます。</p><button disabled={busy} onClick={() => void previewDocumentSetup()}><Plus size={15} />作成内容をプレビュー</button></section> : <article className="document">
-            <div className="doc-meta"><span className="doc-badge"><FileText size={13} />{isJson ? 'JSON フィールド仕様' : '設計ドキュメント'}</span><span className="meta-separator">·</span><span>最終更新: たった今</span><span className="meta-spacer" /><button onClick={() => void gitAction('git_history')}><Clock3 size={14} />履歴</button></div>
+            <div className="doc-meta"><span className="doc-badge"><FileText size={13} />{isImage ? '画像' : isJson ? 'JSON フィールド仕様' : '設計ドキュメント'}</span><span className="meta-separator">·</span><span>最終更新: たった今</span><span className="meta-spacer" /><button onClick={() => void gitAction('git_history')}><Clock3 size={14} />履歴</button></div>
             <h1 className="document-title">{current.split('/').at(-1)?.replace(/\.md$|\.json$/, '').replace(/[-_]/g, ' ')}</h1>
             <div className="author-row"><div className="avatar small">D</div><span>Design Team</span><span className="meta-separator">·</span><span>ドキュメント</span><span className="meta-separator">·</span><span>約 2 分</span></div>
             <div className="editor-toolbar"><div className="toolbar-left">
-              <button className={editing ? 'active' : ''} disabled={!repo || !current || busy} aria-pressed={editing} onClick={() => { if (editing) { const pending = readEditorSnapshot.current(); if (pending !== null) setContent(pending) } setEditing(!editing) }}><BookOpen size={15} />{editing ? '閲覧に戻る' : '編集'}</button>
+              <button className={editing ? 'active' : ''} disabled={!repo || !current || isImage || busy} aria-pressed={editing} onClick={() => { if (editing) { const pending = readEditorSnapshot.current(); if (pending !== null) setContent(pending) } setEditing(!editing) }}><BookOpen size={15} />{editing ? '閲覧に戻る' : '編集'}</button>
               <span className="reading-mode-label">{editing ? '編集中' : '閲覧専用'}</span>
               {isJson && <><button className={mode === 'fields' ? 'active' : ''} onClick={() => { setMode('fields'); setSearchTarget(null) }}><LayoutGrid size={15} />フィールド</button><button className={mode === 'write' ? 'active' : ''} onClick={() => { setMode('write'); setSearchTarget(null) }}><FileJson2 size={15} />JSON</button><button onClick={() => void validateCurrent()}><ShieldCheck size={14} />検証</button></>}
-              {!isJson && <><button disabled={!editing || busy} onClick={() => void importImage(false)}><Image size={14} />画像挿入</button><button disabled={!editing || busy} onClick={() => void importImage(true)}><Image size={14} />置換</button></>}
+              {!isJson && !isImage && <><button disabled={!editing || busy} onClick={() => void importImage(false)}><Image size={14} />画像挿入</button><button disabled={!editing || busy} onClick={() => void importImage(true)}><Image size={14} />置換</button></>}
             </div><div className="toolbar-right"><span className="saved-label">{externalChanged ? '外部変更あり' : dirty ? '● 未保存' : '✓ 保存済み'}</span><button className="save-button" disabled={!dirty || busy} onClick={() => void save()}>{busy ? <LoaderCircle size={14} className="spin" /> : null}保存</button></div></div>
             {searchTarget && !showSearchSource && <div className="search-reading-location" role="status"><span>検索位置 · 行 {searchTarget.line}、列 {searchTarget.column} · {editing ? '編集中' : '閲覧専用'}</span><button onClick={() => setShowSearchSource(true)}>原文を表示</button><button onClick={() => setSearchTarget(null)}>強調を解除</button></div>}
             {validationIssues.length > 0 && <ul className="validation-issues">{validationIssues.map((issue, index) => <li key={`${index}-${issue}`}>{issue}</li>)}</ul>}
             {missingImages.length > 0 && <div className="image-warning"><Image size={14} /><span>画像参照が見つかりません: {missingImages.join('、')}</span></div>}
-            {searchTarget && showSearchSource ? <SearchLocationView content={content} hit={searchTarget} editable={editing} onChange={setContent} onClose={() => { setShowSearchSource(false); setEditorRevision((value) => value + 1) }} /> : isJson && mode === 'fields' ? <section className="fields-editor"><div className="field-intro"><div><h2>構造化フィールド</h2><p>安定した ID で変更履歴を追跡します。</p></div><button className="add-field" disabled={!editing || busy} onClick={addField}><Plus size={14} />項目を追加</button></div><div className="field-table-wrap"><table className="field-table"><thead><tr><th>フィールド名</th><th>表示名</th><th>型</th><th>初期値</th><th>説明</th><th>フィールド ID</th></tr></thead><tbody>{fields.map((field: Record<string, unknown>, index: number) => <tr key={String(field.id ?? index)}>{['name', 'displayName', 'type', 'defaultValue', 'description', 'id'].map((key) => <td key={key}><input value={String(field[key] ?? '')} readOnly={!editing || key === 'id'} onChange={(e) => updateField(index, key, e.target.value)} aria-label={key} /></td>)}</tr>)}</tbody></table></div>{!fields.length && <p className="json-error">有効な JSON の `fields` 配列がありません。JSON タブから形式を確認してください。</p>}</section> : isJson ? <div className="json-source-wrap"><div className="json-note"><ShieldCheck size={15} />編集内容は JSON Schema として検証してから原子的に保存されます。</div><textarea ref={jsonSource} className="json-source" readOnly={!editing} aria-label={editing ? "JSON を編集" : "JSON 閲覧専用"} value={content} onChange={(e) => setContent(e.target.value)} spellCheck={false} /></div> : <Editor key={`${current}:${editorRevision}`} markdown={content} onChange={setContent} editable={editing} searchHit={searchTarget} onNotice={setNotice} snapshotRef={readEditorSnapshot} onError={(error) => setNotice(`文書を表示できません: ${String(error)}`)} />}
+            {isImage ? <ImagePreview key={`${repo}:${current}:${editorRevision}`} path={current} /> : searchTarget && showSearchSource ? <SearchLocationView content={content} hit={searchTarget} editable={editing} onChange={setContent} onClose={() => { setShowSearchSource(false); setEditorRevision((value) => value + 1) }} /> : isJson && mode === 'fields' ? <section className="fields-editor"><div className="field-intro"><div><h2>構造化フィールド</h2><p>安定した ID で変更履歴を追跡します。</p></div><button className="add-field" disabled={!editing || busy} onClick={addField}><Plus size={14} />項目を追加</button></div><div className="field-table-wrap"><table className="field-table"><thead><tr><th>フィールド名</th><th>表示名</th><th>型</th><th>初期値</th><th>説明</th><th>フィールド ID</th></tr></thead><tbody>{fields.map((field: Record<string, unknown>, index: number) => <tr key={String(field.id ?? index)}>{['name', 'displayName', 'type', 'defaultValue', 'description', 'id'].map((key) => <td key={key}><input value={String(field[key] ?? '')} readOnly={!editing || key === 'id'} onChange={(e) => updateField(index, key, e.target.value)} aria-label={key} /></td>)}</tr>)}</tbody></table></div>{!fields.length && <p className="json-error">有効な JSON の `fields` 配列がありません。JSON タブから形式を確認してください。</p>}</section> : isJson ? <div className="json-source-wrap"><div className="json-note"><ShieldCheck size={15} />編集内容は JSON Schema として検証してから原子的に保存されます。</div><textarea ref={jsonSource} className="json-source" readOnly={!editing} aria-label={editing ? "JSON を編集" : "JSON 閲覧専用"} value={content} onChange={(e) => setContent(e.target.value)} spellCheck={false} /></div> : <Editor key={`${current}:${editorRevision}`} markdown={content} onChange={setContent} editable={editing} searchHit={searchTarget} onNotice={setNotice} snapshotRef={readEditorSnapshot} onError={(error) => setNotice(`文書を表示できません: ${String(error)}`)} />}
             <div className="doc-footer"><div className="footer-rule" /><div className="footer-note"><ShieldCheck size={15} /><span>Markdown を正本としてローカルに保存します。独立 Worktree で管理し、起動時に安全な更新を確認します。</span></div><button onClick={() => void gitAction('git_history')}><History size={14} />変更履歴を見る</button></div>
           </article>}
         </div>
         <footer className="statusbar"><span><HardDrive size={13} />{repo ? repo : 'サンプルワークスペース'}</span><span className="statusbar-right">設計書 {git.document_changed.length} / その他 {git.other_changed.length} 変更ファイル <span>·</span>{git.tracking_error ? '追跡先の履歴未検証' : !git.has_upstream ? '追跡先未設定' : git.behind ? `${git.behind} 件のリモート更新` : git.ahead ? `${git.ahead} 件の未送信コミット` : '既知の追跡先と一致（未 Fetch）'}</span></footer>
       </section>
-      <aside className="right-panel">{repo && <UpdatePanel records={updates} busy={busy} status={syncStatus} onSync={() => void synchronizeWorkspace()} onRead={(id) => void readUpdates(id)} onNavigate={(record, file, hunk) => void navigateUpdate(record, file, hunk)} popup={updatePopup} onDismiss={() => setUpdatePopup(null)} />}<div className="panel-tabs"><button className="active">概要</button><button onClick={() => void gitAction('git_history')}>履歴</button><button onClick={() => void gitAction('git_diff')}>変更</button></div><section className="panel-section"><div className="panel-heading"><span>このページについて</span><button><Settings2 size={14} /></button></div><div className="property-card"><div className="property-icon purple"><FileText size={16} /></div><div><b>ドキュメント</b><small>Markdown ページ</small></div></div><div className="property-line"><span>保存場所</span><b>{current.split('/').slice(0, -1).join('/')}</b></div><div className="property-line"><span>状態</span><b><i className={dirty ? 'state-dot orange' : 'state-dot'} />{dirty ? '未保存' : '保存済み'}</b></div><div className="property-line"><span>形式</span><b>{isJson ? 'JSON' : 'Markdown'}</b></div></section><section className="panel-section git-section"><div className="panel-heading"><span>Git ワークスペース</span><button onClick={() => void refresh()}><RefreshCw size={13} /></button></div><div className="git-summary"><div className="git-avatar"><GitBranch size={15} /></div><div><b>{git.branch}</b><small>{git.changed.length ? `設計書 ${git.document_changed.length} / その他 ${git.other_changed.length} 件の変更` : 'ワーキングツリーはクリーン'}</small></div></div><button className="panel-action" onClick={() => void gitAction('git_diff')}><GitCompareArrows size={14} />差分を確認</button><button className="panel-action" onClick={() => void gitAction('git_history')}><History size={14} />コミット履歴</button></section><section className="panel-section activity-section"><div className="panel-heading"><span>最近のアクティビティ</span><button><ChevronDown size={14} /></button></div><div className="activity"><div className="activity-line" /><div className="activity-icon"><Sparkles size={13} /></div><div><b>{git.changed.length ? 'ローカルの変更' : 'ワークスペースを準備しました'}</b><small>{git.changed.length ? git.changed.join(', ') : '設計書を開いて編集を始めましょう'}</small><time>今</time></div></div></section><div className="tip-card"><div className="tip-icon"><Image size={14} /></div><div><b>Markdown と Mermaid</b><p>表、画像参照、Mermaid 図はファイルに保持され、Git で追跡できます。</p></div></div></aside>
+      <aside className="right-panel">{repo && <UpdatePanel records={updates} busy={busy} status={syncStatus} onSync={() => void synchronizeWorkspace()} onRead={(id) => void readUpdates(id)} onNavigate={(record, file, hunk) => void navigateUpdate(record, file, hunk)} popup={updatePopup} onDismiss={() => setUpdatePopup(null)} />}<div className="panel-tabs"><button className="active">概要</button><button onClick={() => void gitAction('git_history')}>履歴</button><button onClick={() => void gitAction('git_diff')}>変更</button></div><section className="panel-section"><div className="panel-heading"><span>このページについて</span><button><Settings2 size={14} /></button></div><div className="property-card"><div className="property-icon purple"><FileText size={16} /></div><div><b>ドキュメント</b><small>{isImage ? '画像ファイル' : isJson ? 'JSON ファイル' : 'Markdown ページ'}</small></div></div><div className="property-line"><span>保存場所</span><b>{current.split('/').slice(0, -1).join('/')}</b></div><div className="property-line"><span>状態</span><b><i className={dirty ? 'state-dot orange' : 'state-dot'} />{dirty ? '未保存' : '保存済み'}</b></div><div className="property-line"><span>形式</span><b>{isImage ? '画像 (JPG / PNG)' : isJson ? 'JSON' : 'Markdown'}</b></div></section><section className="panel-section git-section"><div className="panel-heading"><span>Git ワークスペース</span><button onClick={() => void refresh()}><RefreshCw size={13} /></button></div><div className="git-summary"><div className="git-avatar"><GitBranch size={15} /></div><div><b>{git.branch}</b><small>{git.changed.length ? `設計書 ${git.document_changed.length} / その他 ${git.other_changed.length} 件の変更` : 'ワーキングツリーはクリーン'}</small></div></div><button className="panel-action" onClick={() => void gitAction('git_diff')}><GitCompareArrows size={14} />差分を確認</button><button className="panel-action" onClick={() => void gitAction('git_history')}><History size={14} />コミット履歴</button></section><section className="panel-section activity-section"><div className="panel-heading"><span>最近のアクティビティ</span><button><ChevronDown size={14} /></button></div><div className="activity"><div className="activity-line" /><div className="activity-icon"><Sparkles size={13} /></div><div><b>{git.changed.length ? 'ローカルの変更' : 'ワークスペースを準備しました'}</b><small>{git.changed.length ? git.changed.join(', ') : '設計書を開いて編集を始めましょう'}</small><time>今</time></div></div></section><div className="tip-card"><div className="tip-icon"><Image size={14} /></div><div><b>Markdown と Mermaid</b><p>表、画像参照、Mermaid 図はファイルに保持され、Git で追跡できます。</p></div></div></aside>
     </div>
     <div className="toast" role="status"><span className="toast-dot" />{notice}<button onClick={() => setNotice('')}><X size={13} /></button></div>
     {panel && <div className="modal-backdrop" onClick={() => setPanel(null)}><section className="modal" onClick={(e) => e.stopPropagation()}><header><div><h2>{panel === 'diff' ? '変更差分' : 'ファイル履歴'}</h2><p>{current}</p></div><button onClick={() => setPanel(null)}><X size={17} /></button></header>{panel === 'diff' ? <pre className="diff-view">{diff || '作業ツリーに変更はありません。'}</pre> : <ol className="history-list">{history.map((item, i) => <li key={i}><GitCommitHorizontal size={15} /><code>{item}</code></li>)}{!history.length && <li>このファイルのコミット履歴はありません。</li>}</ol>}</section></div>}

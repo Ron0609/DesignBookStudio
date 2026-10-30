@@ -1,7 +1,7 @@
 const lastProjectKey = 'designbook.lastUnityProject.v1'
 type ProjectStorage = Pick<Storage, 'getItem' | 'setItem'>
 
-export type DocFile = { path: string; kind: 'markdown' | 'json' | 'other' }
+export type DocFile = { path: string; kind: 'markdown' | 'json' | 'image' | 'other' }
 export type GitState = { branch: string; changed: string[]; document_changed: string[]; other_changed: string[]; changes: { path: string; previous_path: string | null; status: string }[]; ahead: number; behind: number; clean: boolean; has_upstream: boolean; tracking_error: string | null }
 export type ProjectInfo = { unity_root: string; git_root: string; documents_path: string | null; has_documents: boolean; worktree_root?: string | null; development_branch?: string | null }
 export type SessionInvoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>

@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 use jsonschema::validator_for;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::process::{Command, Output};
@@ -259,7 +259,7 @@ fn scan_document_tree(repo: &Repository) -> Result<DocumentTree, String> {
             }
             if !file_type.is_file() { continue; }
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
-            let kind = match ext.as_str() { "md" | "markdown" | "mmd" => "markdown", "json" => "json", _ => continue };
+            let kind = match ext.as_str() { "md" | "markdown" | "mmd" => "markdown", "json" => "json", "jpg" | "jpeg" | "png" => "image", _ => continue };
             let canonical_file = path.canonicalize().map_err(|_| format!("設計書ファイルを確認できません: {}", path.display()))?;
             if !canonical_file.starts_with(&root) || !canonical_file.is_file() { continue; }
             let relative_file = canonical_file.strip_prefix(&root).map_err(|_| "設計書ファイルの相対パスを確認できません".to_string())?;
@@ -745,6 +745,32 @@ fn validate_document(path: String, content: String, state: State<'_, RepoState>)
     Ok(validate_document_content(&repo, &path, &content))
 }
 
+const MAX_PREVIEW_IMAGE_BYTES: u64 = 25_000_000;
+
+fn read_preview_image(repo: &Repository, path: &str) -> Result<Vec<u8>, String> {
+    if !repo.has_documents { return Err("設計書ディレクトリがありません".into()); }
+    // Reuse the component-by-component path checks, including Windows junction rejection.
+    let full = mutation_entry(repo, path, false)?;
+    let extension = full.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
+    if !["jpg", "jpeg", "png"].contains(&extension.as_str()) { return Err("JPG / JPEG / PNG のみプレビューできます".into()); }
+    let file = fs::File::open(&full).map_err(|_| "画像を開けません")?;
+    let metadata = file.metadata().map_err(|_| "画像の情報を読み取れません")?;
+    if !metadata.is_file() || metadata.len() > MAX_PREVIEW_IMAGE_BYTES { return Err("画像が大きすぎるか、通常のファイルではありません (上限 25 MB)".into()); }
+    let mut bytes = Vec::new();
+    file.take(MAX_PREVIEW_IMAGE_BYTES + 1).read_to_end(&mut bytes).map_err(|_| "画像を読み取れません")?;
+    if bytes.len() as u64 > MAX_PREVIEW_IMAGE_BYTES { return Err("画像が大きすぎます (上限 25 MB)".into()); }
+    let valid = if extension == "png" { bytes.starts_with(b"\x89PNG\r\n\x1a\n") } else { bytes.starts_with(&[0xff, 0xd8, 0xff]) };
+    if !valid { return Err("画像の内容が拡張子と一致しないか、ファイルが破損しています".into()); }
+    Ok(bytes)
+}
+
+#[tauri::command]
+async fn read_image(path: String, state: State<'_, RepoState>) -> Result<tauri::ipc::Response, String> {
+    let repo = repository(&state)?;
+    tauri::async_runtime::spawn_blocking(move || read_preview_image(&repo, &path).map(tauri::ipc::Response::new))
+        .await.map_err(|_| "画像読み込みタスクに失敗しました")?
+}
+
 #[tauri::command]
 fn check_image_references(document_path: String, references: Vec<String>, state: State<'_, RepoState>) -> Result<Vec<String>, String> {
     let repo = repository(&state)?;
@@ -822,6 +848,13 @@ fn search_documents_impl(repo: &Repository, query: &str, limit: usize) -> Result
     if needle.is_empty() { return Ok(result); }
     if needle.len() > 200 { return Err("検索語は200文字以内で入力してください".into()); }
     for file in document_files(repo)? {
+        if file.kind == "image" {
+            if file.path.to_lowercase().contains(&query.to_lowercase()) {
+                if result.matches.len() >= limit { result.truncated = true; return Ok(result); }
+                result.matches.push(SearchMatch { path: file.path, kind: file.kind, excerpt: String::new(), line: 0, column: 0, length: 0, excerpt_offset: 0, query: query.into() });
+            }
+            continue;
+        }
         let text = safe_existing(repo, &file.path).ok().and_then(|full| {
             fs::metadata(&full).ok().filter(|metadata| metadata.len() <= 5_000_000)?;
             fs::read_to_string(full).ok()
@@ -1322,7 +1355,7 @@ fn main() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .manage(RepoState(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![workspace::preview_workspace, workspace::create_workspace, workspace::sync_workspace, workspace::update_records, workspace::mark_updates_read, workspace::locate_update, open_repository, project_context, close_repository, preview_document_setup, create_document_setup, list_documents, list_document_directories, create_document, create_document_folder, move_document_entry, delete_document_entry, search_documents, read_document, save_document, validate_document, check_image_references, import_image, git_status, git_diff, git_commit, git_branches, git_remotes, git_create_branch, git_switch_branch, git_remote_change, git_set_upstream, git_fetch, git_push_target, git_push_preview, git_pull_ff, git_history, git_field_history])
+        .invoke_handler(tauri::generate_handler![workspace::preview_workspace, workspace::create_workspace, workspace::sync_workspace, workspace::update_records, workspace::mark_updates_read, workspace::locate_update, open_repository, project_context, close_repository, preview_document_setup, create_document_setup, list_documents, list_document_directories, create_document, create_document_folder, move_document_entry, delete_document_entry, search_documents, read_document, save_document, validate_document, check_image_references, read_image, import_image, git_status, git_diff, git_commit, git_branches, git_remotes, git_create_branch, git_switch_branch, git_remote_change, git_set_upstream, git_fetch, git_push_target, git_push_preview, git_pull_ff, git_history, git_field_history])
         .run(tauri::generate_context!())
         .expect("DesignBook Studio could not start");
 }
