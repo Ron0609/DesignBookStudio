@@ -40,3 +40,14 @@ dist-ssr
 !.env.example
 *.pem
 *.key
+
+# Local migration audit (contains original project status and document differences)
+/docs/VNEXT_MIGRATION_AUDIT.json
+/docs/SPARSE_MIGRATION_AUDIT.json
+/docs/SPARSE_MIGRATION_RESULT.json
+
+# Local migration verification
+.migration-*
+
+# Machine-specific Windows shortcuts
+*.lnk

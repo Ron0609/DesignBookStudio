@@ -33,6 +33,9 @@ try {
       unregisterCallback: () => {},
       invoke: async (command, args) => {
         switch (command) {
+          case 'preview_workspace': return { existing: true, sparse_ready: true, sparse_scope: 'DesignDocs', blockers: [], document_changes: [], unpushed_documents: [] }
+          case 'sync_workspace': return { message: '最新です', records: [], new_id: null }
+          case 'project_context':
           case 'open_repository': return { unity_root: 'X:/isolated-fixture', git_root: 'X:/isolated-fixture', documents_path: 'X:/isolated-fixture/DesignDocs', has_documents: true }
           case 'list_documents': return [{ path, kind: 'markdown' }]
           case 'list_document_directories': return ['DesignDocs']

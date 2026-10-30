@@ -15,6 +15,8 @@ import { observeRenderedHit } from './lib/renderedSearch'
 import '@milkdown/crepe/theme/common/style.css'
 import '@milkdown/crepe/theme/frame.css'
 import { BookOpen, ChevronDown, ChevronRight, CircleHelp, Clock3, FileJson2, FileText, Folder, GitBranch, GitCommitHorizontal, GitCompareArrows, GitFork, HardDrive, History, Image, LayoutGrid, ListFilter, LoaderCircle, Plus, RefreshCw, Search, Settings2, ShieldCheck, Sparkles, Upload, X, CloudDownload, CloudUpload } from 'lucide-react'
+import { UpdatePanel } from './UpdatePanel'
+import { prepareWorkspace, updateDocumentPath, updateHit, type UpdateRecord, type ChangeFile, type ChangeHunk, type SyncResult } from './lib/workspace'
 import './App.css'
 
 type GitBranchInfo = { name: string; current: boolean; remote: boolean; upstream: string | null; ahead: number; behind: number }
@@ -94,6 +96,11 @@ function MermaidPreview({ markdown }: { markdown: string }) {
 
 function App() {
   const [repo, setRepo] = useState('')
+  const [projectInfo, setProjectInfo] = useState<ProjectInfo | null>(null)
+  const [updates, setUpdates] = useState<UpdateRecord[]>([])
+  const [updatePopup, setUpdatePopup] = useState<string | null>(null)
+  const [syncStatus, setSyncStatus] = useState('')
+  const syncing = useRef(false)
   const [docsReady, setDocsReady] = useState(false)
   const [docs, setDocs] = useState<DocFile[]>(demoDocs)
   const [current, setCurrent] = useState(demoDocs[0].path)
@@ -107,6 +114,12 @@ function App() {
   const [searchSkipped, setSearchSkipped] = useState<string[]>([])
   const [searchTarget, setSearchTarget] = useState<SearchMatch | null>(null)
   const [showSearchSource, setShowSearchSource] = useState(false)
+  const [updateHighlight, setUpdateHighlight] = useState(false)
+  useEffect(() => {
+    if (!updateHighlight) return
+    const timer = window.setTimeout(() => { setSearchTarget(null); setUpdateHighlight(false) }, 5000)
+    return () => window.clearTimeout(timer)
+  }, [updateHighlight, searchTarget])
   const jsonSource = useRef<HTMLTextAreaElement>(null)
   const [editing, setEditing] = useState(false)
   const readEditorSnapshot = useRef<() => string | null>(() => null)
@@ -177,8 +190,8 @@ function App() {
   const filesInDirectory = (directory: string) => searchable.filter((file) => file.path.slice(0, file.path.lastIndexOf('/')) === directory)
   async function refresh(nextRepo = repo) {
     if (!isTauri() || !nextRepo) return
-    const [files, status, directories] = await Promise.all([invoke<DocFile[]>('list_documents'), invoke<GitState>('git_status'), invoke<string[]>('list_document_directories')])
-    setDocs(files); setGit(status); setDocumentDirectories(directories)
+    const [files, status, directories, context] = await Promise.all([invoke<DocFile[]>('list_documents'), invoke<GitState>('git_status'), invoke<string[]>('list_document_directories'), invoke<ProjectInfo>('project_context')])
+    setDocs(files); setGit(status); setDocumentDirectories(directories); setProjectInfo(context)
   }
   async function beginCreate(kind: 'document' | 'folder') {
     try {
@@ -219,14 +232,71 @@ function App() {
     } catch (error) { setNotice(`作成できませんでした: ${String(error)}`) }
     finally { setBusy(false) }
   }
+  async function synchronizeWorkspace(project = projectInfo, openedPath = current, unsaved = dirty || externalChanged) {
+    if (!project || syncing.current) return
+    const pending = readEditorSnapshot.current()
+    // Opening a new project has no editor buffer to protect. Later retries inspect the live editor too.
+    const protect = unsaved || (project === projectInfo && pending !== null && pending !== saved)
+    syncing.current = true
+    setBusy(true); setSyncStatus('GitHub の更新を確認しています…')
+    try {
+      const result = await invoke<SyncResult>('sync_workspace', { unityRoot: project.unity_root, unsaved: protect })
+      setUpdates(result.records); setUpdatePopup(result.new_id); setSyncStatus(result.message)
+      if (!protect) {
+        const [files, status, directories, context] = await Promise.all([invoke<DocFile[]>('list_documents'), invoke<GitState>('git_status'), invoke<string[]>('list_document_directories'), invoke<ProjectInfo>('project_context')])
+        setDocs(files); setGit(status); setDocumentDirectories(directories); setProjectInfo(context)
+        setDocsReady(directories.length > 0)
+        const next = files.find((file) => file.path === openedPath) ?? files.find((file) => file.kind === 'markdown' || file.kind === 'json')
+        const text = next ? await invoke<string>('read_document', { path: next.path }) : ''
+        setCurrent(next?.path ?? ''); setContent(text); setSaved(text); setEditing(false); setExternalChanged(false)
+        setSearchTarget(null); setSearchMatches([]); setQuery(''); setEditorRevision((value) => value + 1)
+      }
+    } catch (error) {
+      setSyncStatus(`自動同期できません。ローカルの設計書を表示します。再試行してください: ${String(error)}`)
+      try { setUpdates(await invoke<UpdateRecord[]>('update_records')) } catch { /* retain the explicit synchronization error */ }
+    } finally { syncing.current = false; setBusy(false) }
+  }
+  // 保存前の編集を保護しつつ、一定間隔で main の受信だけを実行する。
+  const autoSync = useRef(() => {})
+  useLayoutEffect(() => { autoSync.current = () => { if (repo && !busy && !editing) void synchronizeWorkspace() } })
+  useEffect(() => {
+    if (!repo || !isTauri()) return
+    const timer = window.setInterval(() => autoSync.current(), 60000)
+    return () => window.clearInterval(timer)
+  }, [repo])
+  async function readUpdates(id?: string) {
+    try { setUpdates(await invoke<UpdateRecord[]>('mark_updates_read', { id: id ?? null })) }
+    catch (error) { setNotice(`既読状態を保存できません: ${String(error)}`) }
+  }
+  async function navigateUpdate(record: UpdateRecord, file: ChangeFile, hunk: ChangeHunk | null) {
+    setDiff(file.patch); setPanel('diff')
+    if (!hunk || hunk.removed || busy) return
+    const pending = readEditorSnapshot.current()
+    if (dirty || externalChanged || (pending !== null && pending !== saved)) { setNotice('未保存の編集を保護しました。差分だけを表示します。保存後に移動してください。'); return }
+    const scope = projectInfo?.documents_path && projectInfo.git_root ? projectInfo.documents_path.replaceAll('\\', '/').slice(projectInfo.git_root.replaceAll('\\', '/').length + 1) : 'DesignDocs'
+    const path = updateDocumentPath(file, scope)
+    if (!path) { setNotice('本文の位置を特定できない形式です。読み取り専用の差分を表示します。'); return }
+    try {
+      const text = await invoke<string>('locate_update', { recordId: record.id, path: file.path, line: hunk.line })
+      const hit = updateHit(text, path, hunk)
+      if (!hit) { setNotice('位置を安全に特定できません。差分を表示します。'); return }
+      setCurrent(path); setContent(text); setSaved(text); setMode('write'); setEditing(false)
+      setSearchTarget(hit); setUpdateHighlight(true); setShowSearchSource(false); setSelectedDirectory(parentDirectory(path))
+      setExternalChanged(false); setValidationIssues([]); setMissingImages([]); setEditorRevision((value) => value + 1)
+      setPanel(null); setNotice(`更新箇所: ${path} · ${hunk.heading}。右側の「変更前後の差分」から差分を再表示できます。`)
+      void readUpdates(record.id)
+    } catch (error) { setNotice(String(error)) }
+  }
   async function chooseRepo(restorePath?: string) {
     try {
       if (busy) return
       if (dirty && !await confirmDialog('未保存の変更を破棄して別のプロジェクトを開きますか？')) return
-      const selected = restorePath ?? await open({ directory: true, multiple: false, title: 'Unity プロジェクトのルートを選択' })
+      const selected = restorePath ?? await open({ directory: true, multiple: false, title: '設計書リポジトリを開く' })
       if (typeof selected !== 'string') return
       setBusy(true)
+      if (!await prepareWorkspace(selected, invoke, (message) => confirmDialog(message, { title: '設計書 Worktree の作成', kind: 'warning', okLabel: '作成する', cancelLabel: 'キャンセル' }))) return
       const { project, files, status, directories, first, firstContent } = await loadProjectSnapshot(selected, invoke)
+      setProjectInfo(project); setUpdateHighlight(false); setUpdates([]); setUpdatePopup(null); setSyncStatus('GitHub の更新を確認しています…')
       setRepo(project.unity_root); setDocsReady(project.has_documents); setDocs(files); setGit(status); setDocumentDirectories(directories)
       setSelectedDirectory(directories[0] ?? ''); setTreeMenu(null); setRenamePath(null); setDraggedPath(''); setDropDirectory('')
       setEditing(false); setSearchTarget(null); setSearchError(''); setSearchSkipped([]); setSearchTruncated(false); setSearchPending(false)
@@ -235,9 +305,10 @@ function App() {
       setGitManagerOpen(false); setGitBranches([]); setGitRemotes([]); setPushPreview(null); setSelectedRemote(''); setPushBranch(''); setSelectedLocalBranch(''); setBranchStart(''); setSelectedRemoteBranch(''); setRemoteNameInput(''); setRemoteUrlInput(''); setCommitMessage(''); setPushSetUpstream(false); setCreatePushBranch(false)
       setValidationIssues([]); setMissingImages([]); setExternalChanged(false); setEditorRevision((value) => value + 1)
       externalNoticeShown.current = false
-      setNotice(project.has_documents ? `Unity プロジェクトの設計書を開きました: ${selected}` : `Unity プロジェクトを開きました。設計書ディレクトリはまだありません: ${selected}`)
+      setNotice(project.has_documents ? `独立リポジトリの設計書を開きました: ${selected}` : `Unity プロジェクトを開きました。設計書ディレクトリはまだありません: ${selected}`)
       try { rememberProject(localStorage, project.unity_root) }
       catch (error) { setNotice(`プロジェクトは開きましたが、次回の復元パスを保存できません: ${String(error)}`) }
+      await synchronizeWorkspace(project, first?.path ?? '', false)
     } catch (e) {
       try { if (repo) await invoke('open_repository', { path: repo }); else await invoke('close_repository') }
       catch { try { await invoke('close_repository') } catch { /* backend is unavailable in browser preview */ } }
@@ -273,6 +344,8 @@ function App() {
     finally { setBusy(false) }
   }
   async function selectFile(path: string, target?: SearchMatch) {
+    if (busy || syncing.current) return
+    setUpdateHighlight(false)
     const pending = readEditorSnapshot.current()
     if ((dirty || (pending !== null && pending !== saved)) && !await confirmDialog('未保存の変更があります。破棄して選択した位置を開きますか？', { kind: 'warning' })) return
     try {
@@ -398,7 +471,7 @@ function App() {
     setSelectedLocalBranch((value) => branches.some((branch) => !branch.remote && branch.name === value) ? value : firstLocal?.name || '')
     setSelectedRemote((value) => remotes.some((remote) => remote.name === value) ? value : firstRemote?.name || '')
     setRemoteNameInput((value) => value || firstRemote?.name || '')
-    const target = defaultPushTarget(branches, remotes.map((remote) => remote.name))
+    const target = projectInfo?.worktree_root ? { remote: remotes.some((remote) => remote.name === "origin") ? "origin" : "", branch: "main" } : defaultPushTarget(branches, remotes.map((remote) => remote.name))
     const currentRemoteName = target.remote
     const currentRemoteBranch = target.branch
     setSelectedRemoteBranch((value) => value || currentRemoteBranch || '')
@@ -417,6 +490,7 @@ function App() {
     if (confirmation && !window.confirm(confirmation)) return
     try {
       setBusy(true)
+      if (command === 'git_pull_ff' && projectInfo?.worktree_root) { await synchronizeWorkspace(); await loadGitManager(); return }
       const result = await mutateAndRefresh(() => invoke<string>(command, args), async () => { await refresh(); await loadGitManager(command === 'git_switch_branch') })
       setNotice(result || 'Git 操作が完了しました')
       setPushPreview(null)
@@ -473,8 +547,8 @@ function App() {
     if (!repo || !docsReady || !isTauri() || busy) return
     let active = true
     const timer = window.setInterval(() => {
-      void Promise.all([invoke<DocFile[]>('list_documents'), invoke<GitState>('git_status'), invoke<string[]>('list_document_directories')])
-        .then(([files, status, directories]) => { if (active) { setDocs(files); setGit(status); setDocumentDirectories(directories) } })
+      void Promise.all([invoke<DocFile[]>('list_documents'), invoke<GitState>('git_status'), invoke<string[]>('list_document_directories'), invoke<ProjectInfo>('project_context')])
+        .then(([files, status, directories, context]) => { if (active) { setDocs(files); setGit(status); setDocumentDirectories(directories); setProjectInfo(context) } })
         .catch((error) => { if (active) setNotice(`ワークスペースを更新できません: ${String(error)}`) })
     }, 5000)
     return () => { active = false; window.clearInterval(timer) }
@@ -511,6 +585,7 @@ function App() {
   }, [])
   const fields = isJson ? parseFields(content) : []
   const localBranches = gitBranches.filter((branch) => !branch.remote)
+  const commitBlockReason = busy ? '処理中です。完了後に操作してください。' : dirty || externalChanged ? '未保存の編集または未確認の外部変更があります。保存・確認してください。' : !git.branch ? 'ローカルブランチを確認できません。' : !git.document_changed.length ? 'DesignDocs にコミットする変更がありません。' : !commitMessage.trim() ? 'コミットメッセージを入力してください。' : ''
   const pushInputReason = pushDisabledReason(git, selectedRemote, pushBranch, { busy, dirty, externalChanged, source: selectedLocalBranch })
   const pushBlockReason = pushInputReason || pushAssessmentReason(pushPreview, selectedLocalBranch, selectedRemote, pushBranch)
   const remoteBranches = remoteBranchChoices(gitBranches, selectedRemote)
@@ -522,7 +597,7 @@ function App() {
       <div className="brand"><div className="brand-mark"><BookOpen size={18} /></div><span>DesignBook <b>Studio</b></span><span className="beta">LOCAL</span></div>
       <div className="repo-pill"><GitBranch size={15} /><span>{repo ? repo.split(/[\\/]/).at(-1) : 'プロジェクト未選択'}</span><ChevronDown size={14} /></div>
       <div className="top-spacer" />
-      <div className="branch"><GitBranch size={14} />{git.branch}</div>
+      <div className="branch" title={projectInfo?.documents_path ?? projectInfo?.worktree_root ?? ""}><GitBranch size={14} />XiuxianGame_DesignDocs / Docs: {git.branch || "—"}{projectInfo?.worktree_root && <small> · {projectInfo.worktree_root.split(/[\\/]/).at(-1)}\DesignDocs</small>}</div>
       <div className={`save-state ${dirty ? 'unsaved' : ''}`}><span className="status-dot" />{dirty ? '未保存の変更' : 'すべて保存済み'}</div>
       <button className="icon-button" title="差分を確認" onClick={() => void gitAction('git_diff')}><GitCompareArrows size={16} /></button>
       <button className="push-button" disabled={!repo || busy} onClick={() => void openGitManager()}><GitBranch size={15} />Git 管理（Commit / Push）</button>
@@ -596,22 +671,22 @@ function App() {
             {validationIssues.length > 0 && <ul className="validation-issues">{validationIssues.map((issue, index) => <li key={`${index}-${issue}`}>{issue}</li>)}</ul>}
             {missingImages.length > 0 && <div className="image-warning"><Image size={14} /><span>画像参照が見つかりません: {missingImages.join('、')}</span></div>}
             {searchTarget && showSearchSource ? <SearchLocationView content={content} hit={searchTarget} editable={editing} onChange={setContent} onClose={() => { setShowSearchSource(false); setEditorRevision((value) => value + 1) }} /> : isJson && mode === 'fields' ? <section className="fields-editor"><div className="field-intro"><div><h2>構造化フィールド</h2><p>安定した ID で変更履歴を追跡します。</p></div><button className="add-field" disabled={!editing || busy} onClick={addField}><Plus size={14} />項目を追加</button></div><div className="field-table-wrap"><table className="field-table"><thead><tr><th>フィールド名</th><th>表示名</th><th>型</th><th>初期値</th><th>説明</th><th>フィールド ID</th></tr></thead><tbody>{fields.map((field: Record<string, unknown>, index: number) => <tr key={String(field.id ?? index)}>{['name', 'displayName', 'type', 'defaultValue', 'description', 'id'].map((key) => <td key={key}><input value={String(field[key] ?? '')} readOnly={!editing || key === 'id'} onChange={(e) => updateField(index, key, e.target.value)} aria-label={key} /></td>)}</tr>)}</tbody></table></div>{!fields.length && <p className="json-error">有効な JSON の `fields` 配列がありません。JSON タブから形式を確認してください。</p>}</section> : isJson ? <div className="json-source-wrap"><div className="json-note"><ShieldCheck size={15} />編集内容は JSON Schema として検証してから原子的に保存されます。</div><textarea ref={jsonSource} className="json-source" readOnly={!editing} aria-label={editing ? "JSON を編集" : "JSON 閲覧専用"} value={content} onChange={(e) => setContent(e.target.value)} spellCheck={false} /></div> : <Editor key={`${current}:${editorRevision}`} markdown={content} onChange={setContent} editable={editing} searchHit={searchTarget} onNotice={setNotice} snapshotRef={readEditorSnapshot} onError={(error) => setNotice(`文書を表示できません: ${String(error)}`)} />}
-            <div className="doc-footer"><div className="footer-rule" /><div className="footer-note"><ShieldCheck size={15} /><span>Markdown を正本としてローカルに保存します。Git 同期は手動で行います。</span></div><button onClick={() => void gitAction('git_history')}><History size={14} />変更履歴を見る</button></div>
+            <div className="doc-footer"><div className="footer-rule" /><div className="footer-note"><ShieldCheck size={15} /><span>Markdown を正本としてローカルに保存します。独立 Worktree で管理し、起動時に安全な更新を確認します。</span></div><button onClick={() => void gitAction('git_history')}><History size={14} />変更履歴を見る</button></div>
           </article>}
         </div>
         <footer className="statusbar"><span><HardDrive size={13} />{repo ? repo : 'サンプルワークスペース'}</span><span className="statusbar-right">設計書 {git.document_changed.length} / その他 {git.other_changed.length} 変更ファイル <span>·</span>{git.tracking_error ? '追跡先の履歴未検証' : !git.has_upstream ? '追跡先未設定' : git.behind ? `${git.behind} 件のリモート更新` : git.ahead ? `${git.ahead} 件の未送信コミット` : '既知の追跡先と一致（未 Fetch）'}</span></footer>
       </section>
-      <aside className="right-panel"><div className="panel-tabs"><button className="active">概要</button><button onClick={() => void gitAction('git_history')}>履歴</button><button onClick={() => void gitAction('git_diff')}>変更</button></div><section className="panel-section"><div className="panel-heading"><span>このページについて</span><button><Settings2 size={14} /></button></div><div className="property-card"><div className="property-icon purple"><FileText size={16} /></div><div><b>ドキュメント</b><small>Markdown ページ</small></div></div><div className="property-line"><span>保存場所</span><b>{current.split('/').slice(0, -1).join('/')}</b></div><div className="property-line"><span>状態</span><b><i className={dirty ? 'state-dot orange' : 'state-dot'} />{dirty ? '未保存' : '保存済み'}</b></div><div className="property-line"><span>形式</span><b>{isJson ? 'JSON' : 'Markdown'}</b></div></section><section className="panel-section git-section"><div className="panel-heading"><span>Git ワークスペース</span><button onClick={() => void refresh()}><RefreshCw size={13} /></button></div><div className="git-summary"><div className="git-avatar"><GitBranch size={15} /></div><div><b>{git.branch}</b><small>{git.changed.length ? `設計書 ${git.document_changed.length} / その他 ${git.other_changed.length} 件の変更` : 'ワーキングツリーはクリーン'}</small></div></div><button className="panel-action" onClick={() => void gitAction('git_diff')}><GitCompareArrows size={14} />差分を確認</button><button className="panel-action" onClick={() => void gitAction('git_history')}><History size={14} />コミット履歴</button></section><section className="panel-section activity-section"><div className="panel-heading"><span>最近のアクティビティ</span><button><ChevronDown size={14} /></button></div><div className="activity"><div className="activity-line" /><div className="activity-icon"><Sparkles size={13} /></div><div><b>{git.changed.length ? 'ローカルの変更' : 'ワークスペースを準備しました'}</b><small>{git.changed.length ? git.changed.join(', ') : '設計書を開いて編集を始めましょう'}</small><time>今</time></div></div></section><div className="tip-card"><div className="tip-icon"><Image size={14} /></div><div><b>Markdown と Mermaid</b><p>表、画像参照、Mermaid 図はファイルに保持され、Git で追跡できます。</p></div></div></aside>
+      <aside className="right-panel">{repo && <UpdatePanel records={updates} busy={busy} status={syncStatus} onSync={() => void synchronizeWorkspace()} onRead={(id) => void readUpdates(id)} onNavigate={(record, file, hunk) => void navigateUpdate(record, file, hunk)} popup={updatePopup} onDismiss={() => setUpdatePopup(null)} />}<div className="panel-tabs"><button className="active">概要</button><button onClick={() => void gitAction('git_history')}>履歴</button><button onClick={() => void gitAction('git_diff')}>変更</button></div><section className="panel-section"><div className="panel-heading"><span>このページについて</span><button><Settings2 size={14} /></button></div><div className="property-card"><div className="property-icon purple"><FileText size={16} /></div><div><b>ドキュメント</b><small>Markdown ページ</small></div></div><div className="property-line"><span>保存場所</span><b>{current.split('/').slice(0, -1).join('/')}</b></div><div className="property-line"><span>状態</span><b><i className={dirty ? 'state-dot orange' : 'state-dot'} />{dirty ? '未保存' : '保存済み'}</b></div><div className="property-line"><span>形式</span><b>{isJson ? 'JSON' : 'Markdown'}</b></div></section><section className="panel-section git-section"><div className="panel-heading"><span>Git ワークスペース</span><button onClick={() => void refresh()}><RefreshCw size={13} /></button></div><div className="git-summary"><div className="git-avatar"><GitBranch size={15} /></div><div><b>{git.branch}</b><small>{git.changed.length ? `設計書 ${git.document_changed.length} / その他 ${git.other_changed.length} 件の変更` : 'ワーキングツリーはクリーン'}</small></div></div><button className="panel-action" onClick={() => void gitAction('git_diff')}><GitCompareArrows size={14} />差分を確認</button><button className="panel-action" onClick={() => void gitAction('git_history')}><History size={14} />コミット履歴</button></section><section className="panel-section activity-section"><div className="panel-heading"><span>最近のアクティビティ</span><button><ChevronDown size={14} /></button></div><div className="activity"><div className="activity-line" /><div className="activity-icon"><Sparkles size={13} /></div><div><b>{git.changed.length ? 'ローカルの変更' : 'ワークスペースを準備しました'}</b><small>{git.changed.length ? git.changed.join(', ') : '設計書を開いて編集を始めましょう'}</small><time>今</time></div></div></section><div className="tip-card"><div className="tip-icon"><Image size={14} /></div><div><b>Markdown と Mermaid</b><p>表、画像参照、Mermaid 図はファイルに保持され、Git で追跡できます。</p></div></div></aside>
     </div>
     <div className="toast" role="status"><span className="toast-dot" />{notice}<button onClick={() => setNotice('')}><X size={13} /></button></div>
     {panel && <div className="modal-backdrop" onClick={() => setPanel(null)}><section className="modal" onClick={(e) => e.stopPropagation()}><header><div><h2>{panel === 'diff' ? '変更差分' : 'ファイル履歴'}</h2><p>{current}</p></div><button onClick={() => setPanel(null)}><X size={17} /></button></header>{panel === 'diff' ? <pre className="diff-view">{diff || '作業ツリーに変更はありません。'}</pre> : <ol className="history-list">{history.map((item, i) => <li key={i}><GitCommitHorizontal size={15} /><code>{item}</code></li>)}{!history.length && <li>このファイルのコミット履歴はありません。</li>}</ol>}</section></div>}
-    {gitManagerOpen && <div className="modal-backdrop git-manager-backdrop" onClick={() => setGitManagerOpen(false)}><section className="modal git-manager-modal" onClick={(event) => event.stopPropagation()}><header><div><h2>Commit → Push</h2><p>リポジトリ: {repo} · Git ルートで操作します</p></div><button onClick={() => setGitManagerOpen(false)}><X size={17} /></button></header>
+    {gitManagerOpen && <div className="modal-backdrop git-manager-backdrop" onClick={() => setGitManagerOpen(false)}><section className="modal git-manager-modal" onClick={(event) => event.stopPropagation()}><header><div><h2>Commit → Push</h2><p>Unity: {repo} · 設計書 Git: {projectInfo?.git_root ?? repo}</p></div><button onClick={() => setGitManagerOpen(false)}><X size={17} /></button></header>
       <div className="git-manager-status"><GitBranch size={16} /><b>現在のブランチ: {git.branch || 'detached HEAD'}</b><span>未コミット {git.changed.length} 件</span><span>{git.tracking_error ? "追跡先の履歴未検証 · ahead/behind 未確定" : git.has_upstream ? `ahead ${git.ahead} / behind ${git.behind}` : "upstream 未設定 · ahead/behind 未確定"}</span></div>
       <div className="git-manager-grid">
-        <section className="git-manager-section"><h3><GitCommitHorizontal size={15} />1. Commit</h3><p className="git-manager-summary">現在のブランチ: {git.branch || 'detached HEAD'} · 設計書の未コミット {git.document_changed.length} 件 / その他 {git.other_changed.length} 件</p><small>設計書ディレクトリの変更をまとめて Commit します。先にエディターの編集を保存してください。</small><ul className="git-manager-list">{git.document_changed.map((path) => <li key={path}>[設計書] {path}</li>)}{git.other_changed.map((path) => <li key={path}>[Unity・対象外] {path} — この Commit には含まれません</li>)}</ul><label>コミットメッセージ<input disabled={busy} value={commitMessage} onChange={(event) => setCommitMessage(event.target.value)} placeholder="変更内容を入力" /></label><button disabled={busy || dirty || externalChanged || !git.branch || !git.document_changed.length || !commitMessage.trim()} onClick={() => void commitDaily()}>Commit</button>{(dirty || externalChanged) && <small className="git-manager-warning">未保存の編集または外部変更があります。保存・確認後に続行してください。</small>}</section>
+        <section className="git-manager-section"><h3><GitCommitHorizontal size={15} />1. Commit</h3><p className="git-manager-summary">現在のブランチ: {git.branch || 'detached HEAD'} · 設計書の未コミット {git.document_changed.length} 件 / その他 {git.other_changed.length} 件</p><small>設計書ディレクトリの変更をまとめて Commit します。先にエディターの編集を保存してください。</small><ul className="git-manager-list">{git.document_changed.map((path) => <li key={path}>[設計書] {path}</li>)}{git.other_changed.map((path) => <li key={path}>[Unity・対象外] {path} — この Commit には含まれません</li>)}</ul><label>コミットメッセージ<input disabled={busy} value={commitMessage} onChange={(event) => setCommitMessage(event.target.value)} placeholder="変更内容を入力" /></label><button disabled={Boolean(commitBlockReason)} onClick={() => void commitDaily()}>Commit</button>{commitBlockReason && <small role="status">{commitBlockReason}</small>}{(dirty || externalChanged) && <small className="git-manager-warning">未保存の編集または外部変更があります。保存・確認後に続行してください。</small>}</section>
         <section className="git-manager-section"><h3><CloudUpload size={15} />2. Push</h3>
           <label>送信元ローカルブランチ<select disabled={busy} value={selectedLocalBranch} onChange={(event) => { setSelectedLocalBranch(event.target.value); setPushPreview(null) }}>{localBranches.map((branch) => <option key={branch.name} value={branch.name}>{branch.name}{branch.current ? '（現在）' : ''}</option>)}</select></label>
-          {selectedLocalBranch !== git.branch && <><small>Push 前に選択したブランチへ切り替えてください。</small><button disabled={busy || git.changed.length > 0 || dirty || externalChanged} onClick={() => void runGitManagerAction('git_switch_branch', { name: selectedLocalBranch }, `${selectedLocalBranch} に切り替えますか？`)}>このブランチへ切替</button></>}
+          {selectedLocalBranch !== git.branch && <><small>Push 前に選択したブランチへ切り替えてください。</small><button disabled={Boolean(projectInfo?.worktree_root) || busy || git.changed.length > 0 || dirty || externalChanged} onClick={() => void runGitManagerAction('git_switch_branch', { name: selectedLocalBranch }, `${selectedLocalBranch} に切り替えますか？`)}>このブランチへ切替</button></>}
           <label>送信先リモート<select disabled={busy} value={selectedRemote} onChange={(event) => { setSelectedRemote(event.target.value); setPushBranch(''); setPushPreview(null) }}><option value="">選択してください</option>{gitRemotes.map((remote) => <option key={remote.name} value={remote.name}>{remote.name}</option>)}</select></label>
           <label>送信先ブランチ{createPushBranch ? <input disabled={busy} value={pushBranch} onChange={(event) => { setPushBranch(event.target.value); setPushPreview(null) }} placeholder="新しいリモートブランチ名" /> : <select disabled={busy} value={pushBranch} onChange={(event) => { setPushBranch(event.target.value); setPushPreview(null) }}><option value="">選択してください</option>{[...new Set([...remoteBranches, ...(pushBranch ? [pushBranch] : [])])].map((branch) => <option key={branch} value={branch}>{branch}{remoteBranches.includes(branch) ? '' : '（新規）'}</option>)}</select>}</label>
           <label className="git-manager-check"><input disabled={busy} type="checkbox" checked={createPushBranch} onChange={(event) => { setCreatePushBranch(event.target.checked); setPushBranch(''); setPushPreview(null) }} />新しい送信先ブランチを作成</label>
@@ -622,7 +697,7 @@ function App() {
         </section>
       </div><details className="git-advanced"><summary>詳細 Git 管理（ブランチ・リモート・Fetch / Pull）</summary>
       <div className="git-manager-grid">
-        <section className="git-manager-section"><h3><GitFork size={15} />ブランチ</h3><label>ローカルブランチ<select value={selectedLocalBranch} onChange={(event) => setSelectedLocalBranch(event.target.value)}>{localBranches.map((branch) => <option key={branch.name} value={branch.name}>{branch.name}{branch.current ? ' (現在)' : ''} · upstream: {branch.upstream ?? '未設定'}{branch.upstream ? ` · ahead ${branch.ahead}/behind ${branch.behind}` : ''}</option>)}</select></label><button disabled={busy || !selectedLocalBranch || git.changed.length > 0 || dirty || externalChanged} onClick={() => void runGitManagerAction('git_switch_branch', { name: selectedLocalBranch }, `${selectedLocalBranch} に切り替えます。未コミット変更はありませんか？`)}>選択したブランチへ切替</button>{(git.changed.length > 0 || dirty || externalChanged) && <small className="git-manager-warning">未コミット変更またはエディターの未保存編集があるため切替できません。先に保存するか変更を解決してください。</small>}<label>作成元<select value={branchStart} onChange={(event) => setBranchStart(event.target.value)}>{gitBranches.map((branch) => <option key={branch.name} value={branch.name}>{branch.remote ? `Remote: ${branch.name}` : `Local: ${branch.name}`}</option>)}</select></label><div className="git-manager-inline"><input aria-label="新しいブランチ名" value={newBranchName} onChange={(event) => setNewBranchName(event.target.value)} placeholder="新しいブランチ名" /><button disabled={busy || !newBranchName.trim() || !branchStart} onClick={() => void runGitManagerAction('git_create_branch', { name: newBranchName.trim(), startPoint: branchStart }, `「${newBranchName}」を ${branchStart} から作成しますか？`)}>作成</button></div><h4>既知のリモートブランチ</h4><ul className="git-manager-list">{gitBranches.filter((branch) => branch.remote).map((branch) => <li key={branch.name}>{branch.name}</li>)}{!gitBranches.some((branch) => branch.remote) && <li>Fetch 済みのリモートブランチはありません。</li>}</ul></section>
+        <section className="git-manager-section"><h3><GitFork size={15} />ブランチ</h3>{projectInfo?.worktree_root && <small>設計書は main 固定です。Unity 開発ブランチの切替は行いません。ゲームのリポジトリから独立しています。</small>}<label>ローカルブランチ<select value={selectedLocalBranch} onChange={(event) => setSelectedLocalBranch(event.target.value)}>{localBranches.map((branch) => <option key={branch.name} value={branch.name}>{branch.name}{branch.current ? ' (現在)' : ''} · upstream: {branch.upstream ?? '未設定'}{branch.upstream ? ` · ahead ${branch.ahead}/behind ${branch.behind}` : ''}</option>)}</select></label><button disabled={Boolean(projectInfo?.worktree_root) || busy || !selectedLocalBranch || git.changed.length > 0 || dirty || externalChanged} onClick={() => void runGitManagerAction('git_switch_branch', { name: selectedLocalBranch }, `${selectedLocalBranch} に切り替えます。未コミット変更はありませんか？`)}>選択したブランチへ切替</button>{(git.changed.length > 0 || dirty || externalChanged) && <small className="git-manager-warning">未コミット変更またはエディターの未保存編集があるため切替できません。先に保存するか変更を解決してください。</small>}<label>作成元<select value={branchStart} onChange={(event) => setBranchStart(event.target.value)}>{gitBranches.map((branch) => <option key={branch.name} value={branch.name}>{branch.remote ? `Remote: ${branch.name}` : `Local: ${branch.name}`}</option>)}</select></label><div className="git-manager-inline"><input aria-label="新しいブランチ名" value={newBranchName} onChange={(event) => setNewBranchName(event.target.value)} placeholder="新しいブランチ名" /><button disabled={Boolean(projectInfo?.worktree_root) || busy || !newBranchName.trim() || !branchStart} onClick={() => void runGitManagerAction('git_create_branch', { name: newBranchName.trim(), startPoint: branchStart }, `「${newBranchName}」を ${branchStart} から作成しますか？`)}>作成</button></div><h4>既知のリモートブランチ</h4><ul className="git-manager-list">{gitBranches.filter((branch) => branch.remote).map((branch) => <li key={branch.name}>{branch.name}</li>)}{!gitBranches.some((branch) => branch.remote) && <li>Fetch 済みのリモートブランチはありません。</li>}</ul></section>
         <section className="git-manager-section"><h3><HardDrive size={15} />リモートと upstream</h3><label>リモート<select value={selectedRemote} onChange={(event) => { setSelectedRemote(event.target.value); setPushPreview(null); setRemoteNameInput(event.target.value); setSelectedRemoteBranch('') }}>{gitRemotes.map((remote) => <option key={remote.name} value={remote.name}>{remote.name} · {remote.url}</option>)}</select></label><div className="git-manager-inline"><input aria-label="リモート名" value={remoteNameInput} onChange={(event) => setRemoteNameInput(event.target.value)} placeholder="リモート名" /><input aria-label="リモート URL" type="password" autoComplete="off" value={remoteUrlInput} onChange={(event) => setRemoteUrlInput(event.target.value)} placeholder="リモート URL（入力値は非表示）" /></div><div className="git-manager-actions"><button disabled={busy || !remoteNameInput || !remoteUrlInput} onClick={() => void runGitManagerAction('git_remote_change', { action: 'add', name: remoteNameInput, url: remoteUrlInput }, `リモート「${remoteNameInput}」に ${maskRemoteUrl(remoteUrlInput)} を追加しますか？`)}>追加</button><button disabled={busy || !selectedRemote || !remoteUrlInput} onClick={() => void runGitManagerAction('git_remote_change', { action: 'set-url', name: selectedRemote, url: remoteUrlInput }, `リモート「${selectedRemote}」の URL を ${maskRemoteUrl(remoteUrlInput)} に変更しますか？`)}>URL 変更</button><button disabled={busy || !selectedRemote} onClick={() => void runGitManagerAction('git_remote_change', { action: 'remove', name: selectedRemote, url: null }, `リモート「${selectedRemote}」を削除します。関連する追跡設定と URL がローカル設定から削除されます。リモートサーバー上のデータは削除されません。続行しますか？`)}>削除</button></div><label>既存 upstream に設定<select value={selectedRemoteBranch} onChange={(event) => setSelectedRemoteBranch(event.target.value)}><option value="">リモートブランチを選択</option>{remoteBranches.map((branch) => <option key={branch} value={branch}>{selectedRemote}/{branch}</option>)}</select></label><button disabled={busy || !selectedRemote || !selectedRemoteBranch} onClick={() => void runGitManagerAction('git_set_upstream', { remote: selectedRemote, branch: selectedRemoteBranch }, `現在のブランチ ${git.branch} の upstream を ${selectedRemote}/${selectedRemoteBranch} に設定しますか？`)}>選択した既存 upstream を設定</button><small>一覧にないブランチは既存 upstream として設定できません。未作成のブランチは Push で作成してください。</small></section>
 
         <section className="git-manager-section"><h3><CloudDownload size={15} />Fetch / Pull</h3><label>Fetch 対象リモート<select value={selectedRemote} onChange={(event) => { setSelectedRemote(event.target.value); setPushPreview(null) }}>{gitRemotes.map((remote) => <option key={remote.name} value={remote.name}>{remote.name}</option>)}</select></label><div className="git-manager-actions"><button disabled={busy || !selectedRemote} onClick={() => void runGitManagerAction('git_fetch', { remote: selectedRemote }, `${selectedRemote} から Fetch します。作業ツリーのファイルは変更しません。`)}><CloudDownload size={14} />Fetch</button><button disabled={busy} onClick={() => void runGitManagerAction('git_fetch', { remote: null }, 'すべての remote から Fetch します。作業ツリーのファイルは変更しません。')}>すべて Fetch</button></div><label>Pull 対象ブランチ<select value={selectedRemoteBranch} onChange={(event) => setSelectedRemoteBranch(event.target.value)}><option value="">リモートブランチを選択</option>{remoteBranches.map((branch) => <option key={branch} value={branch}>{selectedRemote}/{branch}</option>)}</select></label><button disabled={busy || !selectedRemote || !selectedRemoteBranch || git.changed.length > 0 || dirty || externalChanged} onClick={() => void runGitManagerAction('git_pull_ff', { remote: selectedRemote, branch: selectedRemoteBranch }, `Fetch 後、${selectedRemote}/${selectedRemoteBranch} を Fast-forward のみで Pull します。未コミット変更がないことを確認してください。分岐や競合の可能性がある場合は停止します。`)}><RefreshCw size={14} />Fast-forward Pull</button><small>Fetch と Pull は別操作です。Pull は未コミット変更がある場合に拒否し、fast-forward できない履歴は統合しません。</small></section>

@@ -61,3 +61,42 @@ pnpm build
 ### 重点测试
 
 Rust temporary-repository tests cover branch listing/current/upstream, branch creation and dirty-switch refusal, credential-safe remote listing and add/update/remove, existing-only upstream selection, explicit Push to a new branch with optional tracking, dirty-worktree preservation and remote-ahead/divergence protections, target ahead/behind preview, Fetch worktree preservation, and clean fast-forward Pull. Frontend unit tests cover remote branch filtering, Push button safeguards, and confirmation text contents.
+
+## vNext：独立 Worktree と GitHub 更新通知（2026-10-30）
+
+最新の動作・安全条件は [vNext 実装記録](VNEXT.md) を参照。本節は旧来の「Unity 作業ツリーを直接操作」「起動時は Fetch しない」という記述を置き換える。
+
+追加した回帰テスト：
+
+- 確認拒否時の無書き込み、Worktree の初回作成と再利用、main 占有時の停止。
+- 元の未コミット設計書、未共有の設計書コミット、パス競合での移行停止。
+- 開発側の HEAD・ブランチ・index・変更ファイルを維持したまま、専用 Worktree の設計書だけを Commit。
+- 既存 Worktree の未コミット変更を保持し、誤ったブランチを拒否。
+- 更新なし、追加・変更・削除・名前変更、JSON と Markdown の複数行変更。
+- 未保存編集・未コミット変更・分岐・接続失敗時の停止と再試行。
+- 設計書以外だけの早送りでは通知しない。
+- 記録の永続化、既読保存、重複通知の抑止、途中終了後の記録回復、破損記録の保護。
+- 正しい変更行への移動、削除差分、現在ファイルが変わった場合の安全な差分表示。
+- ブラウザーでのプロジェクト復元、開発/設計書ブランチの表示、更新通知、本文移動、未保存編集の保護。
+
+実ゲームに対する Git 書き込みテストは行わない。詳細結果と未検証範囲は VNEXT.md に記録する。
+
+実行結果：Rust 65 件、フロントエンド 51 件が成功。Cargo check・Lint・フロントエンド build・Tauri の単体実行ファイル build が成功。検索の既存ブラウザー回帰と、更新通知・移動・未保存保護・既読復元の新規ブラウザー回帰が成功。実 Unity の移行と GitHub 実通信、新ビルドのネイティブ UI 手動確認は未実施。理由と実行ファイルの場所は VNEXT.md を参照。
+
+## Sparse Checkout 回帰（2026-10-31）
+
+[最新の設計・検証記録](SPARSE_WORKTREE.md) を参照。新規に以下を追加した。
+
+- `.git` と DesignDocs だけの実展開、skip-worktree の保持、Unity 側設定の維持。
+- 全展開 Worktree の確認付き変換と、無視ファイルを消さない停止。
+- Sparse 状態での設計書のみの Commit・再オープン・origin/main への初回 Push。
+- 範囲外のステージ済み削除を検知し、元の index を維持して停止。
+- リモートのゲームファイル更新後も Assets を展開しないこと。
+- 無視されたローカル設計書とリモート更新の衝突で上書きしないこと。
+- フロントエンドでの既存 Worktree 変換の確認拒否・承認。
+
+実ゲームでの移行は、開発側 main を切り替える確認が必要なため保留する。実デスクトップ UI の操作確認は、自動テストと区別して記録する。
+
+今回の実行結果：Rust 71 件、フロントエンド 52 件が成功。Cargo check、Lint、フロントエンド build、Tauri --no-bundle build、既存と新規のブラウザー回帰が成功。独立 WebView プロファイルで新 EXE を実起動し、OS ウィンドウ生成と応答まで確認した。実画面の操作確認と実ゲームの移行は未完了。詳細・確認待ちの内容は SPARSE_WORKTREE.md を参照。
+
+ユーザー承認後の実移行（2026-10-31）：Unity 側を既存 feature/shared-foundation に通常切替し、main の専用 Sparse Worktree を作成済み。両方クリーン、元の index と設計書14ファイルのハッシュを維持。専用側は .git と DesignDocs のみ。実 Commit・Push・Fetch・Pull は未実施。前の「実移行は確認待ち」という状態は完了に更新する。実デスクトップ UI 操作の未検証範囲は変わらない。

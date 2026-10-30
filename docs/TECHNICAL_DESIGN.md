@@ -1,3 +1,5 @@
+> 現在は独立リポジトリ main 専用です。[移行状況と現行仕様](INDEPENDENT_REPOSITORY.md)を参照してください。以下の共有 Worktree の説明は旧仕様です。
+
 # 技術設計
 
 ## 目的と構成
@@ -59,3 +61,13 @@ Tauri 文件访问仅通过 Rust command。拒绝包含 `..` 的相对路径、�
 ## 当前限制
 
 当前环境没有 Rust/Cargo 和 MSVC compiler，因此未验证原生编译。JSON Schema 文件应与 JSON 文档同目录，命名为 `name.schema.json` 或 `name.json.schema.json`；禁用外部 `$ref`。设置/帮助/属性面板仍有 UI placeholder。图片支持 PNG/JPG/JPEG/SVG，不做图像转换。
+
+## vNext の構成変更（2026-10-30）
+
+最新の構成は [独立 Worktree と更新通知の実装記録](VNEXT.md) に記載。バックエンド `workspace.rs` が検査・作成・検証・同期・更新記録を担当し、既存のファイル操作と Git 操作は専用 Worktree を持つ Repository を通る。フロントエンド `workspace.ts` と `UpdatePanel.tsx` が確認・通知・変更ナビゲーションを担当する。
+
+Unity 開発側を読み書き対象にする旧方式と、起動時に一切 Fetch しない旧仕様は、この vNext の専用 Worktree と条件付き自動取得・早送り更新へ移行する。実プロジェクトの移行は未コミット設計書があるため停止中。
+
+## Sparse Worktree への更新（2026-10-31）
+
+専用側は DesignDocs だけを展開する。Unity の検証は元の開発側でのみ行い、専用側に Assets・ProjectSettings を要求しない。新規 Worktree は --no-checkout で作成し、worktree-specific Sparse 設定後に初期 index を準備する。厳密な範囲指定のため非 cone モード・通常 index を使用する。詳細は [Sparse Worktree 設計・検証](SPARSE_WORKTREE.md) を参照。

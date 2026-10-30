@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod workspace;
+
 use serde::Serialize;
 use serde_json::Value;
 use jsonschema::validator_for;
@@ -12,7 +14,7 @@ use std::sync::Mutex;
 use tauri::State;
 
 #[derive(Clone)]
-struct Repository { root: PathBuf, git_root: PathBuf, documents: PathBuf, documents_relative: String, git_documents_relative: String, has_documents: bool }
+struct Repository { source_root: Option<PathBuf>, root: PathBuf, git_root: PathBuf, documents: PathBuf, documents_relative: String, git_documents_relative: String, has_documents: bool }
 struct RepoState(Mutex<Option<Repository>>);
 
 #[derive(Serialize)]
@@ -97,7 +99,7 @@ struct SearchResults { matches: Vec<SearchMatch>, truncated: bool, skipped: Vec<
 struct ImportedImage { path: String }
 
 #[derive(Serialize, Clone)]
-struct ProjectInfo { unity_root: String, git_root: String, documents_path: Option<String>, has_documents: bool }
+struct ProjectInfo { unity_root: String, git_root: String, documents_path: Option<String>, has_documents: bool, worktree_root: Option<String>, development_branch: Option<String> }
 
 #[derive(Serialize, Clone, PartialEq, Eq)]
 struct SetupEntry { path: String, kind: String }
@@ -107,9 +109,16 @@ struct SetupPreview { entries: Vec<SetupEntry>, changed_files: Vec<String> }
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+static OPERATION_LOCK: Mutex<()> = Mutex::new(());
+fn operation_guard() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    OPERATION_LOCK.try_lock().map_err(|_| "保存または Git 操作を実行中です。完了後に再試行してください".into())
+}
+
 fn repository(state: &State<'_, RepoState>) -> Result<Repository, String> {
-    state.0.lock().map_err(|_| "リポジトリ状態を読み取れません".to_string())?.clone()
-        .ok_or_else(|| "先に Git リポジトリを開いてください".to_string())
+    let repo = state.0.try_lock().map_err(|_| "同期処理中です。完了後に再試行してください".to_string())?.clone()
+        .ok_or_else(|| "先に Git リポジトリを開いてください".to_string())?;
+    if let Some(source) = &repo.source_root { workspace::validate_target(source, &repo.git_root)?; }
+    Ok(repo)
 }
 
 fn repo_root(state: &State<'_, RepoState>) -> Result<PathBuf, String> { Ok(repository(state)?.git_root) }
@@ -122,7 +131,7 @@ fn git_command(root: &Path, args: &[&str]) -> Command {
         // Tauri is a GUI process; prevent every Git CLI invocation (including polling) from opening a console.
         command.creation_flags(0x08000000);
     }
-    command.args(args).current_dir(root);
+    command.args(args).current_dir(root).env("GIT_TERMINAL_PROMPT", "0").env("GCM_INTERACTIVE", "Never").env("GIT_OPTIONAL_LOCKS", "0");
     command
 }
 
@@ -370,12 +379,14 @@ fn build_repository(root: PathBuf) -> Result<Repository, String> {
         None => (root.join("DesignDocs"), "DesignDocs".into(), false),
     };
     let git_documents_relative = documents.strip_prefix(&git_root).map_err(|_| "設計書ディレクトリが Git リポジトリ外です".to_string())?.to_string_lossy().replace('\\', "/");
-    Ok(Repository { root, git_root, documents, documents_relative, git_documents_relative, has_documents })
+    Ok(Repository { source_root: None, root, git_root, documents, documents_relative, git_documents_relative, has_documents })
 }
 
 fn project_info(repo: &Repository) -> ProjectInfo {
     ProjectInfo {
-        unity_root: repo.root.to_string_lossy().to_string(),
+        unity_root: repo.source_root.as_ref().unwrap_or(&repo.root).to_string_lossy().to_string(),
+        worktree_root: repo.source_root.as_ref().map(|_| repo.git_root.to_string_lossy().to_string()),
+        development_branch: repo.source_root.as_ref().and_then(|root| git_text(root, &["symbolic-ref", "--short", "HEAD"]).ok()),
         git_root: repo.git_root.to_string_lossy().to_string(),
         documents_path: repo.has_documents.then(|| repo.documents.to_string_lossy().to_string()),
         has_documents: repo.has_documents,
@@ -611,11 +622,13 @@ fn delete_entry_impl(repo: &Repository, path: &str, confirmed: bool) -> Result<(
 
 #[tauri::command]
 fn move_document_entry(path: String, parent_path: String, name: String, state: State<'_, RepoState>) -> Result<String, String> {
+    let _operation = operation_guard()?;
     move_entry_impl(&repository(&state)?, &path, &parent_path, &name)
 }
 
 #[tauri::command]
 fn delete_document_entry(path: String, confirmed: bool, state: State<'_, RepoState>) -> Result<(), String> {
+    let _operation = operation_guard()?;
     delete_entry_impl(&repository(&state)?, &path, confirmed)
 }
 
@@ -665,15 +678,24 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<(), String> {
 
 #[tauri::command]
 fn open_repository(path: String, state: State<'_, RepoState>) -> Result<ProjectInfo, String> {
-    let root = PathBuf::from(path).canonicalize().map_err(|_| "選択したフォルダーを開けません".to_string())?;
-    let repo = build_repository(root)?;
+    let _operation = operation_guard()?;
+    // 過去の選択履歴に関係なく、独立した設計書の正本だけを開く。
+    let _ = path;
+    let root = PathBuf::from(r"D:\UnityProjects\Xiuxian_DesignBook").canonicalize().map_err(|_| "独立設計書リポジトリがありません".to_string())?;
+    let repo = workspace::open(&root)?;
     let info = project_info(&repo);
     *state.0.lock().map_err(|_| "リポジトリ状態を更新できません".to_string())? = Some(repo);
     Ok(info)
 }
 
 #[tauri::command]
+fn project_context(state: State<'_, RepoState>) -> Result<ProjectInfo, String> {
+    Ok(project_info(&repository(&state)?))
+}
+
+#[tauri::command]
 fn close_repository(state: State<'_, RepoState>) -> Result<(), String> {
+    let _operation = operation_guard()?;
     *state.0.lock().map_err(|_| "リポジトリ状態を更新できません".to_string())? = None;
     Ok(())
 }
@@ -685,11 +707,12 @@ fn preview_document_setup(state: State<'_, RepoState>) -> Result<SetupPreview, S
 
 #[tauri::command]
 fn create_document_setup(confirmed: bool, expected_changed_files: Vec<String>, state: State<'_, RepoState>) -> Result<ProjectInfo, String> {
+    let _operation = operation_guard()?;
     let repo = repository(&state)?;
     if !confirmed { return Err("初期化はユーザーが確認した後にのみ実行できます".into()); }
     validate_setup_git_snapshot(&repo, &expected_changed_files)?;
     initialize_setup_after_confirmation(&repo, confirmed)?;
-    let updated = build_repository(repo.root)?;
+    let updated = if let Some(source) = &repo.source_root { workspace::open(source)? } else { build_repository(repo.root)? };
     let info = project_info(&updated);
     *state.0.lock().map_err(|_| "リポジトリ状態を更新できません".to_string())? = Some(updated);
     Ok(info)
@@ -705,11 +728,13 @@ fn list_document_directories(state: State<'_, RepoState>) -> Result<Vec<String>,
 
 #[tauri::command]
 fn create_document(parent_path: String, name: String, format: String, state: State<'_, RepoState>) -> Result<String, String> {
+    let _operation = operation_guard()?;
     create_document_impl(&repository(&state)?, &parent_path, &name, &format)
 }
 
 #[tauri::command]
 fn create_document_folder(parent_path: String, name: String, state: State<'_, RepoState>) -> Result<String, String> {
+    let _operation = operation_guard()?;
     create_folder_impl(&repository(&state)?, &parent_path, &name)
 }
 
@@ -744,6 +769,7 @@ fn check_image_references_impl(repo: &Repository, document_path: &str, reference
 
 #[tauri::command]
 fn import_image(document_path: String, source_path: String, replace_path: Option<String>, state: State<'_, RepoState>) -> Result<ImportedImage, String> {
+    let _operation = operation_guard()?;
     let repo = repository(&state)?;
     import_image_impl(&repo, &document_path, &source_path, replace_path.as_deref())
 }
@@ -840,6 +866,7 @@ fn read_document(path: String, state: State<'_, RepoState>) -> Result<String, St
 
 #[tauri::command]
 fn save_document(path: String, content: String, state: State<'_, RepoState>) -> Result<(), String> {
+    let _operation = operation_guard()?;
     save_document_impl(&repository(&state)?, &path, &content)
 }
 
@@ -1062,23 +1089,41 @@ fn git_branches(state: State<'_, RepoState>) -> Result<Vec<GitBranch>, String> {
 fn git_remotes(state: State<'_, RepoState>) -> Result<Vec<GitRemote>, String> { git_remotes_impl(&repo_root(&state)?) }
 
 #[tauri::command]
-fn git_create_branch(name: String, start_point: String, state: State<'_, RepoState>) -> Result<String, String> { git_create_branch_impl(&repo_root(&state)?, &name, &start_point) }
+fn git_create_branch(name: String, start_point: String, state: State<'_, RepoState>) -> Result<String, String> {
+    let _operation = operation_guard()?;
+    if repository(&state)?.source_root.is_some() { return Err("設計書は main 固定です".into()); }
+    git_create_branch_impl(&repo_root(&state)?, &name, &start_point) }
 
 #[tauri::command]
-fn git_switch_branch(name: String, state: State<'_, RepoState>) -> Result<String, String> { git_switch_branch_impl(&repo_root(&state)?, &name) }
+fn git_switch_branch(name: String, state: State<'_, RepoState>) -> Result<String, String> {
+    let _operation = operation_guard()?;
+    let repo = repository(&state)?;
+    if repo.source_root.is_some() { return Err("設計書 Worktree は main 固定です。Unity 開発ブランチは変更しません。".into()); }
+    git_switch_branch_impl(&repo.git_root, &name)
+}
 
 #[tauri::command]
-fn git_remote_change(action: String, name: String, url: Option<String>, state: State<'_, RepoState>) -> Result<String, String> { git_remote_change_impl(&repo_root(&state)?, &action, &name, url.as_deref()) }
+fn git_remote_change(action: String, name: String, url: Option<String>, state: State<'_, RepoState>) -> Result<String, String> {
+    let _operation = operation_guard()?;
+    if repository(&state)?.source_root.is_some() { return Err("設計書の origin は移行時に固定します".into()); }
+    git_remote_change_impl(&repo_root(&state)?, &action, &name, url.as_deref()) }
 
 #[tauri::command]
-fn git_set_upstream(remote: String, branch: String, state: State<'_, RepoState>) -> Result<String, String> { git_set_upstream_impl(&repo_root(&state)?, &remote, &branch) }
+fn git_set_upstream(remote: String, branch: String, state: State<'_, RepoState>) -> Result<String, String> {
+    let _operation = operation_guard()?;
+    if repository(&state)?.source_root.is_some() && (remote != "origin" || branch != "main") { return Err("origin/main のみ使用できます".into()); }
+    git_set_upstream_impl(&repo_root(&state)?, &remote, &branch) }
 
 #[tauri::command]
-fn git_fetch(remote: Option<String>, state: State<'_, RepoState>) -> Result<String, String> { git_fetch_impl(&repo_root(&state)?, remote.as_deref()) }
+fn git_fetch(remote: Option<String>, state: State<'_, RepoState>) -> Result<String, String> {
+    let _operation = operation_guard()?; git_fetch_impl(&repo_root(&state)?, remote.as_deref()) }
 
 #[tauri::command]
 fn git_push_target(remote: String, branch: String, set_upstream: bool, expected_source: String, state: State<'_, RepoState>) -> Result<String, String> {
-    let root = repo_root(&state)?;
+    let _operation = operation_guard()?;
+    let repo = repository(&state)?;
+    if repo.source_root.is_some() && (remote != "origin" || branch != "main") { return Err("設計書の送信先ブランチは main に限定しています".into()); }
+    let root = repo.git_root;
     if expected_source.is_empty() || git_status_impl(&root)?.branch != expected_source {
         return Err("送信元ブランチが変更されました。状態を再読み込みしてください".into());
     }
@@ -1086,10 +1131,19 @@ fn git_push_target(remote: String, branch: String, set_upstream: bool, expected_
 }
 
 #[tauri::command]
-fn git_push_preview(remote: String, branch: String, state: State<'_, RepoState>) -> Result<GitPushPreview, String> { git_push_preview_impl(&repo_root(&state)?, &remote, &branch) }
+fn git_push_preview(remote: String, branch: String, state: State<'_, RepoState>) -> Result<GitPushPreview, String> {
+    let repo = repository(&state)?;
+    if repo.source_root.is_some() && (remote != "origin" || branch != "main") { return Err("設計書の送信先ブランチは main に限定しています".into()); }
+    git_push_preview_impl(&repo.git_root, &remote, &branch)
+}
 
 #[tauri::command]
-fn git_pull_ff(remote: String, branch: String, state: State<'_, RepoState>) -> Result<String, String> { git_pull_ff_impl(&repo_root(&state)?, &remote, &branch) }
+fn git_pull_ff(remote: String, branch: String, state: State<'_, RepoState>) -> Result<String, String> {
+    let _operation = operation_guard()?;
+    let repo = repository(&state)?;
+    if repo.source_root.is_some() { return Err("設計書の更新は更新履歴パネルの『更新を確認』から実行してください。main の安全な早送り更新と履歴保存を行います。".into()); }
+    git_pull_ff_impl(&repo.git_root, &remote, &branch)
+}
 
 #[tauri::command]
 fn git_diff(state: State<'_, RepoState>) -> Result<String, String> {
@@ -1134,6 +1188,7 @@ fn git_sync_impl(root: &Path) -> Result<String, String> {
 
 #[tauri::command]
 fn git_commit(message: String, state: State<'_, RepoState>) -> Result<String, String> {
+    let _operation = operation_guard()?;
     if message.trim().is_empty() { return Err("コミットメッセージを入力してください".into()); }
     let repo = repository(&state)?;
     git_commit_impl(&repo, &message)
@@ -1143,6 +1198,15 @@ fn git_commit_impl(repo: &Repository, message: &str) -> Result<String, String> {
     if !repo.has_documents { return Err("設計書ディレクトリがまだありません。先に作成してください".into()); }
     let root = &repo.git_root;
     let scope = repo.git_documents_relative.as_str();
+    if let Some(source) = &repo.source_root {
+        workspace::validate_target(source, root)?;
+        let staged = git(root, &["diff", "--cached", "--name-only", "--no-renames", "-z"])?;
+        if !staged.status.success() { return Err("ステージ済みファイルを確認できません".into()); }
+        let outside: Vec<_> = staged.stdout.split(|b| *b == 0).filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .filter(|path| path != scope && !path.strip_prefix(scope).is_some_and(|rest| rest.starts_with('/'))).collect();
+        if !outside.is_empty() { return Err(format!("DesignDocs 範囲外のステージ済み変更があります。index を変更せず Commit を停止しました: {}", outside.join(", "))); }
+    }
     for document in document_files(repo)?.into_iter().filter(|file| file.kind == "json") {
         let full = safe_existing(repo, &document.path)?;
         let content = fs::read_to_string(full).map_err(|_| format!("JSON を読み込めません: {}", document.path))?;
@@ -1258,7 +1322,7 @@ fn main() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .manage(RepoState(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![open_repository, close_repository, preview_document_setup, create_document_setup, list_documents, list_document_directories, create_document, create_document_folder, move_document_entry, delete_document_entry, search_documents, read_document, save_document, validate_document, check_image_references, import_image, git_status, git_diff, git_commit, git_branches, git_remotes, git_create_branch, git_switch_branch, git_remote_change, git_set_upstream, git_fetch, git_push_target, git_push_preview, git_pull_ff, git_history, git_field_history])
+        .invoke_handler(tauri::generate_handler![workspace::preview_workspace, workspace::create_workspace, workspace::sync_workspace, workspace::update_records, workspace::mark_updates_read, workspace::locate_update, open_repository, project_context, close_repository, preview_document_setup, create_document_setup, list_documents, list_document_directories, create_document, create_document_folder, move_document_entry, delete_document_entry, search_documents, read_document, save_document, validate_document, check_image_references, import_image, git_status, git_diff, git_commit, git_branches, git_remotes, git_create_branch, git_switch_branch, git_remote_change, git_set_upstream, git_fetch, git_push_target, git_push_preview, git_pull_ff, git_history, git_field_history])
         .run(tauri::generate_context!())
         .expect("DesignBook Studio could not start");
 }
@@ -1407,7 +1471,7 @@ mod tests {
         let root = temp_dir("schema").canonicalize().unwrap();
         let documents = root.join("DesignDocs");
         fs::create_dir_all(&documents).unwrap();
-        (root.clone(), Repository { root: root.clone(), git_root: root.clone(), documents, documents_relative: "DesignDocs".into(), git_documents_relative: "DesignDocs".into(), has_documents: true })
+        (root.clone(), Repository { source_root: None, root: root.clone(), git_root: root.clone(), documents, documents_relative: "DesignDocs".into(), git_documents_relative: "DesignDocs".into(), has_documents: true })
     }
 
     fn empty_unity_repo(label: &str) -> (PathBuf, Repository) {
@@ -1739,7 +1803,7 @@ mod tests {
     fn save_only_writes_file_and_does_not_create_a_commit() {
         let (base, local, _writer) = setup_git_remote("save-no-commit");
         let canonical_local = local.canonicalize().unwrap();
-        let repo = Repository { root: canonical_local.clone(), git_root: canonical_local.clone(), documents: canonical_local.join("DesignDocs").canonicalize().unwrap(), documents_relative: "DesignDocs".into(), git_documents_relative: "DesignDocs".into(), has_documents: true };
+        let repo = Repository { source_root: None, root: canonical_local.clone(), git_root: canonical_local.clone(), documents: canonical_local.join("DesignDocs").canonicalize().unwrap(), documents_relative: "DesignDocs".into(), git_documents_relative: "DesignDocs".into(), has_documents: true };
         let head_before = git_text(&local, &["rev-parse", "HEAD"]).unwrap();
         save_document_impl(&repo, "DesignDocs/page.md", "saved only\n").unwrap();
         assert_eq!(fs::read_to_string(local.join("DesignDocs/page.md")).unwrap(), "saved only\n");
@@ -1966,7 +2030,7 @@ mod tests {
         fs::write(local.join("game.txt"), "staged unrelated\n").unwrap();
         run_git(&local, &["add", "game.txt"]);
         fs::write(local.join("DesignDocs/page.md"), "documentation change\n").unwrap();
-        let repo = Repository { root: local.clone(), git_root: local.clone(), documents: local.join("DesignDocs").canonicalize().unwrap(), documents_relative: "DesignDocs".into(), git_documents_relative: "DesignDocs".into(), has_documents: true };
+        let repo = Repository { source_root: None, root: local.clone(), git_root: local.clone(), documents: local.join("DesignDocs").canonicalize().unwrap(), documents_relative: "DesignDocs".into(), git_documents_relative: "DesignDocs".into(), has_documents: true };
         let result = git_commit_impl(&repo, "docs only").unwrap();
         assert!(result.contains(&git_text(&local, &["rev-parse", "HEAD"]).unwrap()));
         assert_eq!(git_text(&local, &["show", "--format=", "--name-only", "HEAD"]).unwrap(), "DesignDocs/page.md");
@@ -2014,7 +2078,7 @@ mod tests {
         }
         run_git(&local, &["config", "core.hooksPath", "test-hooks"]);
         let before = git_text(&local, &["rev-parse", "HEAD"]).unwrap();
-        let repo = Repository { root: local.clone(), git_root: local.clone(), documents: local.join("DesignDocs").canonicalize().unwrap(), documents_relative: "DesignDocs".into(), git_documents_relative: "DesignDocs".into(), has_documents: true };
+        let repo = Repository { source_root: None, root: local.clone(), git_root: local.clone(), documents: local.join("DesignDocs").canonicalize().unwrap(), documents_relative: "DesignDocs".into(), git_documents_relative: "DesignDocs".into(), has_documents: true };
         let error = git_commit_impl(&repo, "rejected").unwrap_err();
         assert!(error.contains("test-hook-rejected"), "{error}");
         assert_eq!(git_text(&local, &["rev-parse", "HEAD"]).unwrap(), before);
@@ -2083,7 +2147,7 @@ mod tests {
         run_git(&local, &["commit", "-m", "initial"]);
         let original_head = git_text(&local, &["rev-parse", "HEAD"]).unwrap();
         fs::write(local.join("DesignDocs/bad.json"), "{broken").unwrap();
-        let repo = Repository { root: local.clone(), git_root: local.clone(), documents: local.join("DesignDocs").canonicalize().unwrap(), documents_relative: "DesignDocs".into(), git_documents_relative: "DesignDocs".into(), has_documents: true };
+        let repo = Repository { source_root: None, root: local.clone(), git_root: local.clone(), documents: local.join("DesignDocs").canonicalize().unwrap(), documents_relative: "DesignDocs".into(), git_documents_relative: "DesignDocs".into(), has_documents: true };
         assert!(git_commit_impl(&repo, "should fail").unwrap_err().contains("JSON 構文エラー"));
         assert!(git_text(&local, &["diff", "--cached", "--name-only"]).unwrap().is_empty());
         assert_eq!(git_text(&local, &["rev-parse", "HEAD"]).unwrap(), original_head);
