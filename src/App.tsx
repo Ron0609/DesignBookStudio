@@ -552,7 +552,7 @@ function App() {
       void Promise.all([invoke<DocFile[]>('list_documents'), invoke<GitState>('git_status'), invoke<string[]>('list_document_directories'), invoke<ProjectInfo>('project_context')])
         .then(([files, status, directories, context]) => { if (active) { setDocs(files); setGit(status); setDocumentDirectories(directories); setProjectInfo(context) } })
         .catch((error) => { if (active) setNotice(`ワークスペースを更新できません: ${String(error)}`) })
-    }, 5000)
+    }, 60000)
     return () => { active = false; window.clearInterval(timer) }
   }, [repo, docsReady, busy])
 
