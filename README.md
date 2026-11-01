@@ -2,6 +2,14 @@
 
 # DesignBook Studio
 
+## Windows 版のダウンロードと起動
+
+ソースコードを clone しても、実行ファイル（exe）は含まれません。ビルド済みの Windows x64 版は [GitHub Releases](https://github.com/Ron0609/DesignBookStudio/releases/latest) の Assets から `DesignBookStudio.exe` をダウンロードし、任意のフォルダーに保存して起動してください。フロントエンドは exe に組み込まれているため、開発サーバーの起動は不要です。
+
+実行環境には Git CLI と Microsoft Edge WebView2 Runtime が必要です。配布用 exe を実行するだけなら Node.js、Rust、Cargo は不要です。設計書は別途用意したリポジトリから開きます。配布ファイルにはユーザーの設計書、認証情報、ローカル設定を含めません。
+
+ソースから開発・ビルドする場合は、以下の開発環境の手順を参照してください。
+
 ## vNext：独立 Sparse Worktree と GitHub 更新通知
 
 Unity の開発用作業ツリーと設計書の作業ツリーを分離します。Unity プロジェクトを選択すると、同じリポジトリの `main` を使う兄弟ディレクトリ `<プロジェクト名>_DesignBook` を検査します。未作成の場合は、条件を検証して作成先を確認した後にだけ Git Worktree を作成します。フォルダーのコピーは使用しません。Unity が Git ルートのサブディレクトリにある場合は、Git ルートの兄弟ディレクトリに専用 Worktree を置きます。

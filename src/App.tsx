@@ -250,8 +250,12 @@ function App() {
         setDocsReady(directories.length > 0)
         const next = files.find((file) => file.path === openedPath) ?? files.find((file) => file.kind === 'markdown' || file.kind === 'json')
         const text = next && next.kind !== 'image' ? await invoke<string>('read_document', { path: next.path }) : ''
-        setCurrent(next?.path ?? ''); setContent(text); setSaved(text); setEditing(false); setExternalChanged(false)
-        setSearchTarget(null); setSearchMatches([]); setQuery(''); setEditorRevision((value) => value + 1)
+        // Keep the reader mounted when synchronization did not change this document.
+        // Recreating the editor resets its selection and the reader's scroll position.
+        if ((next?.path ?? '') !== current || text !== saved) {
+          setCurrent(next?.path ?? ''); setContent(text); setSaved(text); setEditing(false); setExternalChanged(false)
+          setSearchTarget(null); setSearchMatches([]); setQuery(''); setEditorRevision((value) => value + 1)
+        }
       }
     } catch (error) {
       setSyncStatus(`自動同期できません。ローカルの設計書を表示します。再試行してください: ${String(error)}`)
@@ -263,7 +267,7 @@ function App() {
   useLayoutEffect(() => { autoSync.current = () => { if (repo && !busy && !editing) void synchronizeWorkspace() } })
   useEffect(() => {
     if (!repo || !isTauri()) return
-    const timer = window.setInterval(() => autoSync.current(), 60000)
+    const timer = window.setInterval(() => autoSync.current(), 60 * 60 * 1000)
     return () => window.clearInterval(timer)
   }, [repo])
   async function readUpdates(id?: string) {
@@ -552,7 +556,7 @@ function App() {
       void Promise.all([invoke<DocFile[]>('list_documents'), invoke<GitState>('git_status'), invoke<string[]>('list_document_directories'), invoke<ProjectInfo>('project_context')])
         .then(([files, status, directories, context]) => { if (active) { setDocs(files); setGit(status); setDocumentDirectories(directories); setProjectInfo(context) } })
         .catch((error) => { if (active) setNotice(`ワークスペースを更新できません: ${String(error)}`) })
-    }, 60000)
+    }, 60 * 60 * 1000)
     return () => { active = false; window.clearInterval(timer) }
   }, [repo, docsReady, busy])
 
