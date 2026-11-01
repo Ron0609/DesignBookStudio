@@ -50,16 +50,17 @@ describe('project restoration and Git refresh', () => {
     rememberProject(storage, 'X:/temporary/Unity')
     const reopen = vi.fn(async () => {})
     await restoreProject(storage, reopen)
-    expect(reopen).toHaveBeenCalledWith('D:\\UnityProjects\\Xiuxian_DesignBook')
+    expect(reopen).toHaveBeenCalledWith('X:/temporary/Unity')
   })
-  it('opens the fixed repository on first launch and preserves errors', async () => {
+  it('waits for selection on first launch and preserves restoration errors', async () => {
     const storage = memoryStorage()
     const open = vi.fn(async () => { throw new Error('access denied') })
-    await expect(restoreProject(storage, open)).rejects.toThrow('access denied')
+    await restoreProject(storage, open)
+    expect(open).not.toHaveBeenCalled()
     rememberProject(storage, 'X:/missing')
     await expect(restoreProject(storage, open)).rejects.toThrow('access denied')
     await expect(restoreProject(storage, open)).rejects.toThrow('access denied')
-    expect(open).toHaveBeenLastCalledWith('D:\\UnityProjects\\Xiuxian_DesignBook')
+    expect(open).toHaveBeenLastCalledWith('X:/missing')
   })
   it.each(['Commit', 'Push'])('%s reloads authoritative Git state before reporting success', async (operation) => {
     const events: string[] = []

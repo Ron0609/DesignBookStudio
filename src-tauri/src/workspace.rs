@@ -24,7 +24,9 @@ pub struct WorkspacePreview {
 
 
 // 独立設計書リポジトリだけを受け入れ、ゲーム側の Git 操作を防止する。
-const DESIGN_ROOT: &str = r"D:\UnityProjects\Xiuxian_DesignBook";
+fn standalone_candidate(root: &Path) -> bool {
+    root.join(".git").is_dir() && !root.join("Assets").exists() && !root.join("ProjectSettings").exists()
+}
 fn standalone(root: &Path) -> Result<(), String> {
     let canonical = root.canonicalize().map_err(|_| "設計書パスを解決できません")?;
     let root = canonical.as_path();
@@ -32,24 +34,25 @@ fn standalone(root: &Path) -> Result<(), String> {
         return Err("独立した設計書リポジトリの main を開いてください".into());
     }
     reject_link(&fs::symlink_metadata(root.join(".git")).map_err(|_| "Git 管理情報を検査できません")?)?;
-    if git_text(root, &["config", "--get", "designbook.repository"])? != "XiuxianGame_DesignDocs" {
-        return Err("設計書リポジトリの識別情報が一致しません".into());
+    if root.join("Assets").exists() || root.join("ProjectSettings").exists() {
+        return Err("ゲームの作業ディレクトリは開けません。独立した設計書リポジトリを選択してください".into());
     }
+    let documents = root.join("DesignDocs");
+    let metadata = fs::symlink_metadata(&documents).map_err(|_| "DesignDocs がありません。設計書リポジトリのルートを選択してください")?;
+    reject_link(&metadata)?;
+    if !metadata.is_dir() { return Err("DesignDocs はディレクトリである必要があります".into()); }
     if discover_git_root(root)? != root.canonicalize().map_err(|_| "設計書パスを解決できません")? || common(root)? != root.join(".git").canonicalize().map_err(|_| "Git 管理情報を解決できません")? {
         return Err("共有 Worktree は使用できません".into());
     }
-    // 作成承認前は origin 未設定で閲覧できる。設定後は送受信先を固定する。
+    // クローン元の URL は固定しない。送受信先が異なる設定は拒否する。
     if let Ok(url) = git_text(root, &["remote", "get-url", "origin"]) {
-        if url != "https://github.com/Ron0609/XiuxianGame_DesignDocs.git" {
-            return Err("origin が XiuxianGame_DesignDocs と一致しません".into());
-        }
         let push = git_text(root, &["remote", "get-url", "--push", "origin"])?;
         if push != url { return Err("送信用 URL が origin と一致しません".into()); }
     }
     Ok(())
 }
-fn standalone_open() -> Result<Repository, String> {
-    let root = Path::new(DESIGN_ROOT).canonicalize().map_err(|_| "独立設計書リポジトリがありません")?;
+fn standalone_open(path: &Path) -> Result<Repository, String> {
+    let root = path.canonicalize().map_err(|_| "独立設計書リポジトリがありません")?;
     standalone(&root)?;
     let documents = root.join("DesignDocs");
     reject_link(&fs::symlink_metadata(&documents).map_err(|_| "DesignDocs がありません")?)?;
@@ -76,8 +79,8 @@ fn target_path(source: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn inspect(path: &Path) -> Result<WorkspacePreview, String> {
-    if path.canonicalize().ok() == Path::new(DESIGN_ROOT).canonicalize().ok() && Path::new(DESIGN_ROOT).join(".git").is_dir() {
-        let repo = standalone_open()?;
+    if standalone_candidate(path) {
+        let repo = standalone_open(path)?;
         let root = repo.root.to_string_lossy().to_string();
         return Ok(WorkspacePreview { unity_root: root.clone(), git_root: root.clone(), worktree: root, development_branch: "main".into(), head: git_text(&repo.root, &["rev-parse", "HEAD"])?, upstream: git_text(&repo.root, &["rev-parse", "--abbrev-ref", "@{upstream}"]).ok(), existing: true, blockers: vec![], source_changes: vec![], staged: vec![], document_changes: vec![], unpushed_documents: vec![], worktree_changes: vec![], sparse_ready: true, sparse_scope: "DesignDocs".into() });
     }
@@ -272,8 +275,8 @@ pub fn create(path: &Path, confirmed: bool) -> Result<WorkspacePreview, String> 
 }
 
 pub fn open(path: &Path) -> Result<Repository, String> {
-    // 選択画面や旧保存パスからも、移行後は固定された独立リポジトリを開く。
-    if path.canonicalize().ok() == Path::new(DESIGN_ROOT).canonicalize().ok() && Path::new(DESIGN_ROOT).join(".git").is_dir() { return standalone_open(); }
+    // 通常の clone は Unity ファイルやローカル専用設定なしで開く。
+    if standalone_candidate(path) { return standalone_open(path); }
     let preview = inspect(path)?;
     if !preview.existing || !preview.blockers.is_empty() { return Err(format!("設計書 Worktree を開けません。{}", preview.blockers.join("\n"))); }
     let source = PathBuf::from(preview.unity_root);
@@ -461,7 +464,7 @@ pub fn sync(repo: &Repository, journal: &Path, unsaved: bool) -> Result<SyncResu
 
 #[tauri::command]
 pub async fn preview_workspace(path: String) -> Result<WorkspacePreview, String> {
-    tauri::async_runtime::spawn_blocking(move || { let _ = path; inspect(Path::new(DESIGN_ROOT)) }).await.map_err(|_| "Worktree 検査タスクに失敗しました")?
+    tauri::async_runtime::spawn_blocking(move || inspect(Path::new(&path))).await.map_err(|_| "Worktree 検査タスクに失敗しました")?
 }
 #[tauri::command]
 pub async fn create_workspace(path: String, confirmed: bool) -> Result<WorkspacePreview, String> {
@@ -545,19 +548,24 @@ mod tests {
         run(&f.writer, &["add", "-A"]); run(&f.writer, &["commit", "-m", "remote docs update"]); run(&f.writer, &["push", "origin", "main"]);
     }
     #[test]
-    fn independent_identity_accepts_main_and_rejects_shared_worktrees_wrong_remote_and_branch() {
-        // 隔離した Git だけを使って、誤送信とゲーム側の混入を検証する。
+    fn independent_identity_accepts_clones_and_rejects_game_directories_wrong_push_remote_and_branch() {
         let f = fixture();
         run(&f.source, &["switch", "main"]);
-        run(&f.source, &["config", "designbook.repository", "XiuxianGame_DesignDocs"]);
         assert!(standalone(&f.source).is_err());
-        run(&f.source, &["remote", "remove", "origin"]);
+        // Only this fixture's temporary directories are removed.
+        fs::remove_dir_all(f.source.join("Assets")).unwrap();
+        fs::remove_dir_all(f.source.join("ProjectSettings")).unwrap();
+        // No designbook.repository configuration and no machine-specific path.
         standalone(&f.source).unwrap();
-        run(&f.source, &["remote", "add", "origin", "https://github.com/Ron0609/XiuxianGame_DesignDocs.git"]);
-        standalone(&f.source).unwrap();
-        run(&f.source, &["config", "remote.origin.pushurl", "https://github.com/Ron0609/XiuxianGame_Unity.git"]);
+        let opened = open(&f.source).unwrap();
+        assert_eq!(opened.git_root, f.source.canonicalize().unwrap());
+        assert_eq!(opened.documents, f.source.join("DesignDocs").canonicalize().unwrap());
+        assert!(inspect(&f.source).unwrap().existing);
+        run(&f.source, &["config", "remote.origin.pushurl", "https://example.invalid/other.git"]);
         assert!(standalone(&f.source).is_err());
         run(&f.source, &["config", "--unset", "remote.origin.pushurl"]);
+        run(&f.source, &["remote", "remove", "origin"]);
+        standalone(&f.source).unwrap();
         run(&f.source, &["switch", "feature/player"]);
         assert!(standalone(&f.source).is_err());
     }

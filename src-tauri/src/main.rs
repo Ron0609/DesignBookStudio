@@ -679,9 +679,7 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<(), String> {
 #[tauri::command]
 fn open_repository(path: String, state: State<'_, RepoState>) -> Result<ProjectInfo, String> {
     let _operation = operation_guard()?;
-    // 過去の選択履歴に関係なく、独立した設計書の正本だけを開く。
-    let _ = path;
-    let root = PathBuf::from(r"D:\UnityProjects\Xiuxian_DesignBook").canonicalize().map_err(|_| "独立設計書リポジトリがありません".to_string())?;
+    let root = PathBuf::from(path).canonicalize().map_err(|_| "選択した設計書リポジトリが存在しないか、アクセスできません".to_string())?;
     let repo = workspace::open(&root)?;
     let info = project_info(&repo);
     *state.0.lock().map_err(|_| "リポジトリ状態を更新できません".to_string())? = Some(repo);

@@ -4,9 +4,13 @@
 
 ## Windows 版のダウンロードと起動
 
-ソースコードを clone しても、実行ファイル（exe）は含まれません。ビルド済みの Windows x64 版は [GitHub Releases](https://github.com/Ron0609/DesignBookStudio/releases/latest) の Assets から `DesignBookStudio.exe` をダウンロードし、任意のフォルダーに保存して起動してください。フロントエンドは exe に組み込まれているため、開発サーバーの起動は不要です。
+リポジトリを clone した場合は、ルートの `DesignBookStudio.exe` を直接起動できます。ビルド済みの Windows x64 版は [GitHub Releases](https://github.com/Ron0609/DesignBookStudio/releases/latest) の Assets から `DesignBookStudio.exe` をダウンロードし、任意のフォルダーに保存して起動してください。フロントエンドは exe に組み込まれているため、開発サーバーの起動は不要です。
 
 実行環境には Git CLI と Microsoft Edge WebView2 Runtime が必要です。配布用 exe を実行するだけなら Node.js、Rust、Cargo は不要です。設計書は別途用意したリポジトリから開きます。配布ファイルにはユーザーの設計書、認証情報、ローカル設定を含めません。
+
+初回起動後は「プロジェクトを開く」で、clone した設計書リポジトリのルートを選択してください。`DesignDocs` と `.git` ディレクトリがあり、現在のブランチが `main` の独立リポジトリを使用します。Unity、`Assets`、`ProjectSettings`、固定ドライブ、`designbook.repository` のローカル設定は不要です。ゲームの作業ディレクトリと共有 Worktree は対象外です。フォルダー名や remote URL は固定しませんが、origin の取得先と送信先が異なる場合は保護のため停止します。
+
+初回起動ではフォルダー選択を待ちます。次回以降は最後に正常に開いたパスだけを復元します。GitHub 同期と一覧の定期更新は毎時です。起動時には初回更新を行います。
 
 ソースから開発・ビルドする場合は、以下の開発環境の手順を参照してください。
 

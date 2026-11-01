@@ -22,9 +22,7 @@ export function rememberProject(storage: ProjectStorage, path: string) {
 }
 
 export async function restoreProject(storage: ProjectStorage, openProject: (path: string) => Promise<void>) {
-  // 旧 Unity 保存パスは独立リポジトリへ移行する。
-  const path = 'D:\\UnityProjects\\Xiuxian_DesignBook'
-  void storage
+  const path = storage.getItem(lastProjectKey)
   if (path) await openProject(path)
 }
 
