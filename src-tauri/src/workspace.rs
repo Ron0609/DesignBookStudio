@@ -382,9 +382,13 @@ fn parse_hunks(patch: &str, content: &str, deleted: bool) -> Vec<ChangeHunk> {
 
 // Drain both pipes while waiting so a credential helper or a full stderr pipe cannot hang the UI.
 fn timed_fetch(root: &Path, args: &[&str]) -> Result<Output, String> {
+    timed_command(git_command(root, args), 45)
+}
+
+fn timed_command(mut command: Command, seconds: u64) -> Result<Output, String> {
     use std::io::Read;
     use std::process::Stdio;
-    let mut child = git_command(root, args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|_| "Git を起動できません")?;
+    let mut child = command.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|_| "Git を起動できません")?;
     let stdout = child.stdout.take().ok_or("Git stdout を取得できません")?;
     let stderr = child.stderr.take().ok_or("Git stderr を取得できません")?;
     let out = std::thread::spawn(move || { let mut data = Vec::new(); let _ = stdout.take(8_000_000).read_to_end(&mut data); data });
@@ -394,7 +398,7 @@ fn timed_fetch(root: &Path, args: &[&str]) -> Result<Output, String> {
         if let Some(status) = child.try_wait().map_err(|_| "Git の状態を取得できません")? {
             return Ok(Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() });
         }
-        if start.elapsed() > std::time::Duration::from_secs(45) {
+        if start.elapsed() > std::time::Duration::from_secs(seconds) {
             let _ = child.kill(); let _ = child.wait();
             return Err("接続確認がタイムアウトしました。ローカルの設計書は保持されています。接続を確認して再試行してください。".into());
         }
@@ -426,7 +430,13 @@ pub fn sync(repo: &Repository, journal: &Path, unsaved: bool) -> Result<SyncResu
     }
     if require_remote(&repo.git_root, "origin").is_err() { return paused("GitHub 作成・初回 Push の承認待ちです。ローカル設計書を表示しています。".into(), records); }
     let fetch = timed_fetch(&repo.git_root, &["fetch", "--no-tags", "--no-recurse-submodules", "origin", "+refs/heads/main:refs/remotes/origin/main"])?;
-    if !fetch.status.success() { return paused(format!("オフラインで表示しています。取得に失敗しました。接続・認証を確認して再試行してください。\n{}", safe_git_output(&fetch)), records); }
+    if !fetch.status.success() {
+        let error = String::from_utf8_lossy(&fetch.stderr).to_lowercase();
+        if ["authentication", "could not read username", "interactivity", "terminal prompts disabled", "repository not found", "403", "401"].iter().any(|part| error.contains(part)) {
+            return paused("GitHub の認証またはアクセス権を確認できません。「GitHub アカウントを再認証」を選択して再試行してください。".into(), records);
+        }
+        return paused(format!("GitHub から取得できませんでした。接続設定を確認してください。ローカルの設計書は保持されています。\n{}", safe_git_output(&fetch)), records);
+    }
     let after = git_text(&repo.git_root, &["rev-parse", "refs/remotes/origin/main^{commit}"])?;
     if before == after { return paused("設計書は最新です。".into(), records); }
     if !git(&repo.git_root, &["merge-base", "--is-ancestor", &before, &after])?.status.success() {
@@ -460,6 +470,53 @@ pub fn sync(repo: &Repository, journal: &Path, unsaved: bool) -> Result<SyncResu
     if let Some(record) = records.iter_mut().find(|r| r.id == id) { record.applied = true; }
     save_records(journal, &records)?;
     Ok(SyncResult { message: "GitHub から安全に早送り更新しました。".into(), records, new_id: if new_record { Some(id) } else { recovered } })
+}
+
+#[derive(Serialize)]
+pub struct GithubAuthStatus { accessible: bool, required: bool, message: String }
+
+fn github_https(root: &Path) -> Result<bool, String> {
+    let url = git_text(root, &["remote", "get-url", "origin"])?;
+    // Login is restricted to GitHub.com, never an arbitrary URL from repository config.
+    Ok(url.starts_with("https://github.com/"))
+}
+
+fn auth_status(repo: &Repository) -> Result<GithubAuthStatus, String> {
+    if !github_https(&repo.git_root)? {
+        return Ok(GithubAuthStatus { accessible: true, required: false, message: String::new() });
+    }
+    let output = timed_fetch(&repo.git_root, &["ls-remote", "--heads", "origin", "main"])?;
+    if output.status.success() {
+        return Ok(GithubAuthStatus { accessible: true, required: false, message: "GitHub へのアクセスを確認しました。".into() });
+    }
+    let error = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    let required = ["authentication", "could not read username", "interactivity", "terminal prompts disabled", "repository not found", "403", "401", "credential-manager"].iter().any(|part| error.contains(part));
+    Ok(GithubAuthStatus { accessible: false, required, message: if required {
+        "GitHub の認証またはアクセス権を確認してください。「GitHub にログイン」からブラウザーで認証できます。非公開リポジトリの招待承認も必要です。".into()
+    } else { "GitHub に接続できません。ネットワークまたは Git の接続設定を確認してください。ローカルの設計書は閲覧できます。".into() } })
+}
+
+#[tauri::command]
+pub async fn github_auth_status(state: State<'_, RepoState>) -> Result<GithubAuthStatus, String> {
+    let repo = repository(&state)?;
+    tauri::async_runtime::spawn_blocking(move || auth_status(&repo)).await.map_err(|_| "認証確認タスクに失敗しました")?
+}
+
+#[tauri::command]
+pub async fn github_login(state: State<'_, RepoState>) -> Result<GithubAuthStatus, String> {
+    let repo = repository(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = operation_guard()?;
+        if !github_https(&repo.git_root)? { return Err("ブラウザーログインは origin が https://github.com/ の場合に利用できます。SSH 等は既存の認証設定を使用します。".into()); }
+        let available = git(&repo.git_root, &["credential-manager", "--version"])?;
+        if !available.status.success() { return Err("Git Credential Manager が見つかりません。Git for Windows のセットアップで Git Credential Manager を有効にしてください。ソフトから自動インストールは行いません。".into()); }
+        let mut command = git_command(&repo.git_root, &["credential-manager", "github", "login", "--url", "https://github.com", "--browser", "--force"]);
+        command.env("GCM_INTERACTIVE", "Always").env("GCM_GUI_PROMPT", "1");
+        let output = timed_command(command, 180)?;
+        // Never return authentication process output, which may contain sensitive values.
+        if !output.status.success() { return Err("GitHub ログインがキャンセルされたか失敗しました。ブラウザーの認証とリポジトリへのアクセス権を確認して再試行してください。".into()); }
+        auth_status(&repo)
+    }).await.map_err(|_| "GitHub ログインタスクに失敗しました")?
 }
 
 #[tauri::command]

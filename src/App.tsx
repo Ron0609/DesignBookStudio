@@ -101,6 +101,8 @@ function App() {
   const [updates, setUpdates] = useState<UpdateRecord[]>([])
   const [updatePopup, setUpdatePopup] = useState<string | null>(null)
   const [syncStatus, setSyncStatus] = useState('')
+  const [authRequired, setAuthRequired] = useState(false)
+  const [loginPrompt, setLoginPrompt] = useState(false)
   const syncing = useRef(false)
   const [docsReady, setDocsReady] = useState(false)
   const [docs, setDocs] = useState<DocFile[]>(demoDocs)
@@ -242,6 +244,9 @@ function App() {
     syncing.current = true
     setBusy(true); setSyncStatus('GitHub の更新を確認しています…')
     try {
+      const auth = await invoke<{ accessible: boolean; required: boolean; message: string }>('github_auth_status')
+      setAuthRequired(auth.required)
+      if (!auth.accessible) { setSyncStatus(auth.message); if (auth.required) setLoginPrompt(true); return }
       const result = await invoke<SyncResult>('sync_workspace', { unityRoot: project.unity_root, unsaved: protect })
       setUpdates(result.records); setUpdatePopup(result.new_id); setSyncStatus(result.message)
       if (!protect) {
@@ -261,6 +266,19 @@ function App() {
       setSyncStatus(`自動同期できません。ローカルの設計書を表示します。再試行してください: ${String(error)}`)
       try { setUpdates(await invoke<UpdateRecord[]>('update_records')) } catch { /* retain the explicit synchronization error */ }
     } finally { syncing.current = false; setBusy(false) }
+  }
+  async function loginGithub() {
+    if (busy || !repo) return
+    setBusy(true); setLoginPrompt(false); setSyncStatus('ブラウザーで GitHub にログインしてください。最大3分で待機を終了します。')
+    try {
+      const auth = await invoke<{ accessible: boolean; required: boolean; message: string }>('github_login')
+      setAuthRequired(auth.required); setSyncStatus(auth.message)
+      if (auth.accessible) {
+        setNotice('GitHub の認証とリポジトリへのアクセスを確認しました。')
+        await synchronizeWorkspace()
+      }
+    } catch (error) { setAuthRequired(true); setSyncStatus(String(error)) }
+    finally { setBusy(false) }
   }
   // 保存前の編集を保護しつつ、一定間隔で main の受信だけを実行する。
   const autoSync = useRef(() => {})
@@ -302,7 +320,7 @@ function App() {
       setBusy(true)
       if (!await prepareWorkspace(selected, invoke, (message) => confirmDialog(message, { title: '設計書 Worktree の作成', kind: 'warning', okLabel: '作成する', cancelLabel: 'キャンセル' }))) return
       const { project, files, status, directories, first, firstContent } = await loadProjectSnapshot(selected, invoke)
-      setProjectInfo(project); setUpdateHighlight(false); setUpdates([]); setUpdatePopup(null); setSyncStatus('GitHub の更新を確認しています…')
+      setAuthRequired(false); setLoginPrompt(false); setProjectInfo(project); setUpdateHighlight(false); setUpdates([]); setUpdatePopup(null); setSyncStatus('GitHub の更新を確認しています…')
       setRepo(project.unity_root); setDocsReady(project.has_documents); setDocs(files); setGit(status); setDocumentDirectories(directories)
       setSelectedDirectory(directories[0] ?? ''); setTreeMenu(null); setRenamePath(null); setDraggedPath(''); setDropDirectory('')
       setEditing(false); setSearchTarget(null); setSearchError(''); setSearchSkipped([]); setSearchTruncated(false); setSearchPending(false)
@@ -682,7 +700,8 @@ function App() {
         </div>
         <footer className="statusbar"><span><HardDrive size={13} />{repo ? repo : 'サンプルワークスペース'}</span><span className="statusbar-right">設計書 {git.document_changed.length} / その他 {git.other_changed.length} 変更ファイル <span>·</span>{git.tracking_error ? '追跡先の履歴未検証' : !git.has_upstream ? '追跡先未設定' : git.behind ? `${git.behind} 件のリモート更新` : git.ahead ? `${git.ahead} 件の未送信コミット` : '既知の追跡先と一致（未 Fetch）'}</span></footer>
       </section>
-      <aside className="right-panel">{repo && <UpdatePanel records={updates} busy={busy} status={syncStatus} onSync={() => void synchronizeWorkspace()} onRead={(id) => void readUpdates(id)} onNavigate={(record, file, hunk) => void navigateUpdate(record, file, hunk)} popup={updatePopup} onDismiss={() => setUpdatePopup(null)} />}<div className="panel-tabs"><button className="active">概要</button><button onClick={() => void gitAction('git_history')}>履歴</button><button onClick={() => void gitAction('git_diff')}>変更</button></div><section className="panel-section"><div className="panel-heading"><span>このページについて</span><button><Settings2 size={14} /></button></div><div className="property-card"><div className="property-icon purple"><FileText size={16} /></div><div><b>ドキュメント</b><small>{isImage ? '画像ファイル' : isJson ? 'JSON ファイル' : 'Markdown ページ'}</small></div></div><div className="property-line"><span>保存場所</span><b>{current.split('/').slice(0, -1).join('/')}</b></div><div className="property-line"><span>状態</span><b><i className={dirty ? 'state-dot orange' : 'state-dot'} />{dirty ? '未保存' : '保存済み'}</b></div><div className="property-line"><span>形式</span><b>{isImage ? '画像 (JPG / PNG)' : isJson ? 'JSON' : 'Markdown'}</b></div></section><section className="panel-section git-section"><div className="panel-heading"><span>Git ワークスペース</span><button onClick={() => void refresh()}><RefreshCw size={13} /></button></div><div className="git-summary"><div className="git-avatar"><GitBranch size={15} /></div><div><b>{git.branch}</b><small>{git.changed.length ? `設計書 ${git.document_changed.length} / その他 ${git.other_changed.length} 件の変更` : 'ワーキングツリーはクリーン'}</small></div></div><button className="panel-action" onClick={() => void gitAction('git_diff')}><GitCompareArrows size={14} />差分を確認</button><button className="panel-action" onClick={() => void gitAction('git_history')}><History size={14} />コミット履歴</button></section><section className="panel-section activity-section"><div className="panel-heading"><span>最近のアクティビティ</span><button><ChevronDown size={14} /></button></div><div className="activity"><div className="activity-line" /><div className="activity-icon"><Sparkles size={13} /></div><div><b>{git.changed.length ? 'ローカルの変更' : 'ワークスペースを準備しました'}</b><small>{git.changed.length ? git.changed.join(', ') : '設計書を開いて編集を始めましょう'}</small><time>今</time></div></div></section><div className="tip-card"><div className="tip-icon"><Image size={14} /></div><div><b>Markdown と Mermaid</b><p>表、画像参照、Mermaid 図はファイルに保持され、Git で追跡できます。</p></div></div></aside>
+      {loginPrompt && !busy && <div className="modal-backdrop"><section className="history-modal" role="dialog" aria-modal="true" aria-label="GitHub ログイン"><header><h2>GitHub へのログインが必要です</h2></header><p>設計書の更新には GitHub の認証が必要です。ブラウザーでアクセス権のあるアカウントにログインしてください。認証情報は Git Credential Manager が管理し、このソフトには保存しません。</p><footer><button onClick={() => setLoginPrompt(false)}>後で（ローカルで閲覧）</button><button onClick={() => void loginGithub()}>GitHub にログイン</button></footer></section></div>}
+      <aside className="right-panel">{repo && <UpdatePanel records={updates} busy={busy} status={syncStatus} onLogin={() => void loginGithub()} authRequired={authRequired} onSync={() => void synchronizeWorkspace()} onRead={(id) => void readUpdates(id)} onNavigate={(record, file, hunk) => void navigateUpdate(record, file, hunk)} popup={updatePopup} onDismiss={() => setUpdatePopup(null)} />}<div className="panel-tabs"><button className="active">概要</button><button onClick={() => void gitAction('git_history')}>履歴</button><button onClick={() => void gitAction('git_diff')}>変更</button></div><section className="panel-section"><div className="panel-heading"><span>このページについて</span><button><Settings2 size={14} /></button></div><div className="property-card"><div className="property-icon purple"><FileText size={16} /></div><div><b>ドキュメント</b><small>{isImage ? '画像ファイル' : isJson ? 'JSON ファイル' : 'Markdown ページ'}</small></div></div><div className="property-line"><span>保存場所</span><b>{current.split('/').slice(0, -1).join('/')}</b></div><div className="property-line"><span>状態</span><b><i className={dirty ? 'state-dot orange' : 'state-dot'} />{dirty ? '未保存' : '保存済み'}</b></div><div className="property-line"><span>形式</span><b>{isImage ? '画像 (JPG / PNG)' : isJson ? 'JSON' : 'Markdown'}</b></div></section><section className="panel-section git-section"><div className="panel-heading"><span>Git ワークスペース</span><button onClick={() => void refresh()}><RefreshCw size={13} /></button></div><div className="git-summary"><div className="git-avatar"><GitBranch size={15} /></div><div><b>{git.branch}</b><small>{git.changed.length ? `設計書 ${git.document_changed.length} / その他 ${git.other_changed.length} 件の変更` : 'ワーキングツリーはクリーン'}</small></div></div><button className="panel-action" onClick={() => void gitAction('git_diff')}><GitCompareArrows size={14} />差分を確認</button><button className="panel-action" onClick={() => void gitAction('git_history')}><History size={14} />コミット履歴</button></section><section className="panel-section activity-section"><div className="panel-heading"><span>最近のアクティビティ</span><button><ChevronDown size={14} /></button></div><div className="activity"><div className="activity-line" /><div className="activity-icon"><Sparkles size={13} /></div><div><b>{git.changed.length ? 'ローカルの変更' : 'ワークスペースを準備しました'}</b><small>{git.changed.length ? git.changed.join(', ') : '設計書を開いて編集を始めましょう'}</small><time>今</time></div></div></section><div className="tip-card"><div className="tip-icon"><Image size={14} /></div><div><b>Markdown と Mermaid</b><p>表、画像参照、Mermaid 図はファイルに保持され、Git で追跡できます。</p></div></div></aside>
     </div>
     <div className="toast" role="status"><span className="toast-dot" />{notice}<button onClick={() => setNotice('')}><X size={13} /></button></div>
     {panel && <div className="modal-backdrop" onClick={() => setPanel(null)}><section className="modal" onClick={(e) => e.stopPropagation()}><header><div><h2>{panel === 'diff' ? '変更差分' : 'ファイル履歴'}</h2><p>{current}</p></div><button onClick={() => setPanel(null)}><X size={17} /></button></header>{panel === 'diff' ? <pre className="diff-view">{diff || '作業ツリーに変更はありません。'}</pre> : <ol className="history-list">{history.map((item, i) => <li key={i}><GitCommitHorizontal size={15} /><code>{item}</code></li>)}{!history.length && <li>このファイルのコミット履歴はありません。</li>}</ol>}</section></div>}

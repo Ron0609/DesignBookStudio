@@ -131,6 +131,10 @@ fn git_command(root: &Path, args: &[&str]) -> Command {
         // Tauri is a GUI process; prevent every Git CLI invocation (including polling) from opening a console.
         command.creation_flags(0x08000000);
     }
+    // Use the same GCM for browser login and GitHub HTTPS requests; never change gitconfig.
+    command.args(["-c", "credential.https://github.com.helper=", "-c", "credential.https://github.com.helper=manager"]);
+    #[cfg(windows)]
+    command.env("GCM_CREDENTIAL_STORE", "wincredman");
     command.args(args).current_dir(root).env("GIT_TERMINAL_PROMPT", "0").env("GCM_INTERACTIVE", "Never").env("GIT_OPTIONAL_LOCKS", "0");
     command
 }
@@ -1353,7 +1357,7 @@ fn main() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .manage(RepoState(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![workspace::preview_workspace, workspace::create_workspace, workspace::sync_workspace, workspace::update_records, workspace::mark_updates_read, workspace::locate_update, open_repository, project_context, close_repository, preview_document_setup, create_document_setup, list_documents, list_document_directories, create_document, create_document_folder, move_document_entry, delete_document_entry, search_documents, read_document, save_document, validate_document, check_image_references, read_image, import_image, git_status, git_diff, git_commit, git_branches, git_remotes, git_create_branch, git_switch_branch, git_remote_change, git_set_upstream, git_fetch, git_push_target, git_push_preview, git_pull_ff, git_history, git_field_history])
+        .invoke_handler(tauri::generate_handler![workspace::github_auth_status, workspace::github_login, workspace::preview_workspace, workspace::create_workspace, workspace::sync_workspace, workspace::update_records, workspace::mark_updates_read, workspace::locate_update, open_repository, project_context, close_repository, preview_document_setup, create_document_setup, list_documents, list_document_directories, create_document, create_document_folder, move_document_entry, delete_document_entry, search_documents, read_document, save_document, validate_document, check_image_references, read_image, import_image, git_status, git_diff, git_commit, git_branches, git_remotes, git_create_branch, git_switch_branch, git_remote_change, git_set_upstream, git_fetch, git_push_target, git_push_preview, git_pull_ff, git_history, git_field_history])
         .run(tauri::generate_context!())
         .expect("DesignBook Studio could not start");
 }
