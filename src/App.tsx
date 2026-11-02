@@ -149,6 +149,16 @@ function App() {
   const [history, setHistory] = useState<string[]>([])
   const [diff, setDiff] = useState('')
   const [setupPreview, setSetupPreview] = useState<SetupPreview | null>(null)
+  const [collapsedDirectories, setCollapsedDirectories] = useState<Set<string>>(() => new Set())
+  const toggleDirectory = (directory: string) => setCollapsedDirectories((previous) => {
+    const next = new Set(previous)
+    if (next.has(directory)) next.delete(directory); else next.add(directory)
+    return next
+  })
+  useEffect(() => { setCollapsedDirectories(new Set()) }, [repo])
+  useEffect(() => {
+    setCollapsedDirectories((previous) => new Set([...previous].filter((directory) => !current.startsWith(`${directory}/`))))
+  }, [current])
   const [newItemKind, setNewItemKind] = useState<'document' | 'folder' | null>(null)
   const [newItemName, setNewItemName] = useState('')
   const [newItemParent, setNewItemParent] = useState('')
@@ -647,7 +657,7 @@ function App() {
               </button> })}
             </section>)}
           </section>}
-          {!query.trim() && treeDirectories.map((directory) => {
+          {!query.trim() && treeDirectories.filter((directory) => ![...collapsedDirectories].some((parent) => directory.startsWith(`${parent}/`))).map((directory) => {
             const files = filesInDirectory(directory)
             const depth = Math.max(0, directory.split('/').length - documentRoot.split('/').length)
             return <section className="tree-group" key={directory}>
@@ -663,9 +673,9 @@ function App() {
                 onDragOver={(event) => { if (!busy && canDropEntry(draggedPath, directory)) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDropDirectory(directory) } }}
                 onDragLeave={() => setDropDirectory('')}
                 onDrop={(event) => { event.preventDefault(); event.stopPropagation(); if (!busy && canDropEntry(draggedPath, directory)) { setSelectedDirectory(directory); void changeTreeEntry(draggedPath, directory, draggedPath.split('/').at(-1) ?? '') } setDropDirectory('') }}>
-                <ChevronDown size={13} /><Folder size={14} /><span title={directory}>{directory === documentRoot ? directory : directory.split('/').at(-1)}</span><span className="count">{files.length}</span>
+                <button className="folder-toggle" aria-label={`${directory} を${collapsedDirectories.has(directory) ? '展開' : '折りたたむ'}`} aria-expanded={!collapsedDirectories.has(directory)} draggable={false} onClick={(event) => { event.stopPropagation(); toggleDirectory(directory) }} onKeyDown={(event) => event.stopPropagation()}><ChevronDown size={13} style={{ transform: collapsedDirectories.has(directory) ? 'rotate(-90deg)' : undefined }} /></button><Folder size={14} /><span title={directory}>{directory === documentRoot ? directory : directory.split('/').at(-1)}</span><span className="count">{files.length}</span>
               </div>
-              {files.map((file) => <button key={file.path} disabled={busy} draggable={Boolean(repo && !busy)}
+              {!collapsedDirectories.has(directory) && files.map((file) => <button key={file.path} disabled={busy} draggable={Boolean(repo && !busy)}
                 onDragStart={(event) => { event.dataTransfer.setData('application/x-designbook-path', file.path); event.dataTransfer.effectAllowed = 'move'; setDraggedPath(file.path); setTreeMenu(null) }}
                 onDragEnd={() => { setDraggedPath(''); setDropDirectory('') }}
                 onContextMenu={(event) => showTreeMenu(event, file.path, false)}
